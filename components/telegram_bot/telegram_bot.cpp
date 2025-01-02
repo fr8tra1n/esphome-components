@@ -20,7 +20,7 @@
 #include <StreamString.h>
 #else
 #define F(x) x
-#define printf_P(fmt, ...) printf(fmt, ##__VA_ARGS__) P
+#define printf_P(fmt, ...) printf(fmt, ##__VA_ARGS__)
 
 class String : public std::string
 {
@@ -465,7 +465,7 @@ namespace esphome
         struct mg_http_message *hm = (struct mg_http_message *)ev_data;
         // printf("\r\nresponse message from telegram: %.*s\r\n", (int) hm->message.len, hm->message.buf);
 
-        String payload = String(hm->body.buf, hm->body.len);
+        String payload = String((const char*&)hm->body.buf, hm->body.len);
         // printf("\r\nresponse body from telegram: %s\r\n", payload.c_str());
         if (!global_notify->processMessage(payload.c_str()))
         {
