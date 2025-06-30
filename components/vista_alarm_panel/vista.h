@@ -16,14 +16,30 @@
 #define CMDQUEUESIZE 2
 #endif
 #define FAULTQUEUESIZE 5
+#define LRRADDR 3
 
 // Used to read bits on F7 message
 #define BIT_MASK_BYTE1_BEEP 0x07
 #define BIT_MASK_BYTE1_NIGHT 0x10
-
+//F7 00 00 51 10 21 00 - 50 28 - 02 00 00 4C //fault lowbat
+//F7 00 00 07 10 16 00 - 12 28 - 02 00 00 20 //check co
+//F7 00 00 07 10 03 00 - 00 28 - 02 00 00 46 //fault open
+//F7 00 00 40 00 08 00 - 5C 28 - 02 00 00 33 //system ready low bat
+//F7 00 00 20 00 08 00 - 4C 28 - 02 00 00 53 /system not ready low bat
+//F7 00 00 03 10 08 00 - CC 28 - 02 00 00 31 // system arming stay
+//F7 00 00 03 10 08 00 - CC 28 - 02 00 00 31 // system armed stay
+//F7 00 00 40 00 BF 00 - 12 28 - 02 00 00 43 //system check 103 ready
+//F7 00 00 20 00 BF 04 - 02 28 - 02 00 00 43 //system check 103 not ready
+//F7 00 00 20 00 04 01 - 50 38 - 02 00 00 42 // zone bypass
+//F7 00 00 03 10 17 00 - 80 2B - 02 00 00 41 // alarm zone 17 , in alarm
+//F7 00 00 02 00 08 00 - 8C 28 - 02 00 00 44 //entry when armed
+//F7 00 00 03 10 17 00 - 00 2A - 02 00 00 41 // alarm zone 17 , cleared, disarmed
+//F7 00 00 03 10 EA 00 - 00 2A - 02 00 00 45 // exit alarm
+//F7 00 00 03 10 EA 00 - 00 2A - 02 00 00 45 //alarm cancelled
+//F7 00 00 07 10 12 00 - 80 08 - 02 00 00 41  //armed stay countdown
 #define BIT_MASK_BYTE2_ARMED_HOME 0x80
 #define BIT_MASK_BYTE2_LOW_BAT 0x40
-#define BIT_MASK_BYTE2_ALARM_ZONE 0x20
+#define BIT_MASK_BYTE2_ZONE_FIRE 0x20
 #define BIT_MASK_BYTE2_READY 0x10
 #define BIT_MASK_BYTE2_UNKNOWN 0x08
 #define BIT_MASK_BYTE2_SYSTEM_FLAG 0x04
@@ -40,7 +56,6 @@
 #define BIT_MASK_BYTE3_IN_ALARM 0x01
 
 #define F7_MESSAGE_LENGTH 45
-#define F8_MESSAGE_LENGTH 7
 #define N98_MESSAGE_LENGTH 6
 
 #define MAX_MODULES 9
@@ -95,8 +110,7 @@ struct statusFlagType
     {
         int code;
         uint8_t qual;
-        int zone;
-        uint8_t user;
+        int data;
         uint8_t partition;
     } lrr;
 };
@@ -123,11 +137,14 @@ const keyType keyType_INIT = {.key = 0, .kpaddr = 0, .direct = false, .count = 0
 struct cmdQueueItem
 {
     char cbuf[CMDBUFSIZE];
+    char extbuf[CMDBUFSIZE];
     bool newCmd;
     bool newExtCmd;
+    size_t size;
+    size_t rawsize;
     struct statusFlagType statusFlags;
 };
-const cmdQueueItem cmdQueueItem_INIT = {.newCmd = false, .newExtCmd = false};
+const cmdQueueItem cmdQueueItem_INIT = {.newCmd = false, .newExtCmd = false,.size=0,.rawsize=0};
 
 class Vista
 {
@@ -156,6 +173,7 @@ public:
         if (keypadAddr > 0)
             kpAddr = keypadAddr;
     }
+    void addModule(byte addr);
     bool dataReceived;
     void IRAM_ATTR rxHandleISR(), txHandleISR();
     bool areEqual(char *, char *, uint8_t);
@@ -166,11 +184,11 @@ public:
     char *cbuf, *extbuf, *extcmd;
 
     bool lrrSupervisor;
-    char expansionAddr;
     void setExpFault(int, bool);
     bool newExtCmd, newCmd;
     bool filterOwnTx;
     expanderType zoneExpanders[MAX_MODULES];
+    uint8_t moduleIdx;
     char b; // used in isr
     bool charAvail();
     bool cmdAvail();
@@ -179,6 +197,10 @@ public:
     // std::queue<struct cmdQueueItem> cmdQueue;
 
 private:
+    char lcbuf[14];
+    uint8_t _lcbuflen;
+    uint8_t _retriesf9;
+    char expectCmd;
     keyType *outbuf;
     char *tmpOutBuf;
     cmdQueueItem *cmdQueue;
@@ -214,10 +236,10 @@ private:
     char haveExpMessage;
     char expFault, expBitAddr;
     char expFaultBits;
-    bool decodePacket();
+    size_t decodePacket();
     uint8_t getExtBytes();
     volatile bool is2400;
-    void pushCmdQueueItem();
+    void pushCmdQueueItem(size_t cmdsize=0,size_t rawsize=0);
     bool invertRead;
 
     char IRAM_ATTR addrToBitmask1(char addr)

@@ -209,8 +209,6 @@ namespace esphome
             to_schedule_lock_ = xSemaphoreCreateMutex();
 #endif
             webServerPtr = this;
-          //  this->pref_ = global_preferences->make_preference<KeypadConfig>(fnv1_hash(App.get_compilation_time()));
-
         }
 
 #ifdef USE_WEBKEYPAD_CSS_INCLUDE
@@ -220,23 +218,9 @@ namespace esphome
         void WebServer::set_js_include(const char *js_include) { this->js_include_ = js_include; }
 #endif
 
-        void WebServer::set_keypad_config(const char *json_keypad_config,uint8_t version)
+        void WebServer::set_keypad_config(const char *json_keypad_config)
         {
-            // if (!this->pref_.load(&keypadconfig_) || keypadconfig_.version < version){
-            //     ESP_LOGD(TAG,"version=%d,config=%s",keypadconfig_.config,keypadconfig_.version);
-      //              keypadconfig_.version = version;
-     //               memcpy(keypadconfig_.config,json_keypad_config,strlen(json_keypad_config));
-  //                  this->pref_.save(&keypadconfig_);
-
-           // } 
-             //if new version is higher or same than flash version, overwrite. Save version and config
-             json_keypad_config_=json_keypad_config;
-        }
-
-        const char * WebServer::get_keypad_config()
-        {
-           // return (char*) &keypadconfig_.config ;
-           return json_keypad_config_.c_str();
+            _json_keypad_config = json_keypad_config;
         }
 
         const std::string WebServer::get_config_json(unsigned long cid)
@@ -324,8 +308,6 @@ namespace esphome
                     });
             }
 #endif
-
-
             this->set_interval(10000, [this]()
                                { this->push(PING, "", millis(), 30000); });
         }
@@ -911,7 +893,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"brightness",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("brightness"))
                     {
-                        std::string num = doc["brightness"];
+                        std::string num=doc["brightness"];
                         auto brightness = parse_number<float>(num);
                         if (brightness.has_value())
                         {
@@ -923,7 +905,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"r",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("r"))
                     {
-                        std::string num = doc["r"];
+                        std::string num=doc["r"];
                         auto r = parse_number<float>(num);
                         if (r.has_value())
                         {
@@ -935,7 +917,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"g",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("g"))
                     {
-                        std::string num = doc["g"];
+                        std::string num=doc["g"];
                         auto g = parse_number<float>(num);
                         if (g.has_value())
                         {
@@ -947,7 +929,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"b",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("b"))
                     {
-                        std::string num = doc["b"];
+                        std::string num=doc["b"];
                         auto b = parse_number<float>(num);
                         if (b.has_value())
                         {
@@ -959,7 +941,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"white_value",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("white_value"))
                     {
-                        std::string num = doc["white_value"];
+                        std::string num=doc["white_value"];
                         auto white_value = parse_number<float>(num);
                         if (white_value.has_value())
                         {
@@ -971,7 +953,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"color_temp",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("color_temp"))
                     {
-                        std::string num = doc["color_temp"];
+                        std::string num=doc["color_temp"];
                         auto color_temp = parse_number<float>(num);
                         if (color_temp.has_value())
                         {
@@ -983,7 +965,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"flash",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("flash"))
                     {
-                        std::string num = doc["flash"];
+                        std::string num=doc["flash"];
                         auto flash = parse_number<uint32_t>(num);
                         if (flash.has_value())
                         {
@@ -995,7 +977,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"transition",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("transition"))
                     {
-                        std::string num = doc["transition"];
+                        std::string num=doc["transition"];
                         auto transition = parse_number<uint32_t>(num);
                         if (transition.has_value())
                         {
@@ -1023,7 +1005,7 @@ namespace esphome
                     // if (mg_http_get_var(&hm->body,"transition",buf,sizeof(buf)) > 0) {
                     if (doc.containsKey("transition"))
                     {
-                        std::string num = doc["transition"];
+                        std::string num=doc["transition"];
                         auto transition = parse_number<uint32_t>(num);
                         if (transition.has_value())
                         {
@@ -2050,9 +2032,9 @@ namespace esphome
 
             if (doc["method"] == "GET")
             {
-                if (doc["action"] == "getconfig" && strlen(get_keypad_config()) > 0)
+                if (doc["action"] == "getconfig" && strlen(_json_keypad_config) > 0)
                 {
-                    ws_reply(c, get_keypad_config(), true);
+                    ws_reply(c, _json_keypad_config, true);
                     return;
                 }
                 // ws_reply(c,"",true);
@@ -2063,12 +2045,6 @@ namespace esphome
                 ws_reply(c, "", false);
                 return;
             }
-            // if (doc.containsKey("config")) {
-            //    String conf=doc["config"].as<String>();
-            //     set_keypad_config((char *)conf.c_str());
-            //     ws_reply(c, "", true);
-            //     return;
-            // }
             int partition = 1; // get default partition
             if (doc.containsKey("partition"))
             {
@@ -3044,9 +3020,9 @@ namespace esphome
                     if (crypt)
                         enc = srv->encrypt(enc.c_str());
                     mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%ul,\"%s\":%s}"), "type", "app_config", "data", enc.c_str());
-                    if (strlen(srv->get_keypad_config()) > 0)
+                    if (strlen(srv->_json_keypad_config) > 0)
                     {
-                        enc = srv->get_keypad_config();
+                        enc = srv->_json_keypad_config;
                         if (crypt)
                             enc = srv->encrypt(enc.c_str());
                         mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%s}"), "type", "key_config", "data", enc.c_str());
@@ -3089,9 +3065,9 @@ namespace esphome
                         mg_printf(c, PSTR("event: %s\r\ndata: %s\r\n\r\n"), "sorting_group", enc.c_str());
                     }
 
-                    if (strlen(srv->get_keypad_config()) > 0)
+                    if (strlen(srv->_json_keypad_config) > 0)
                     {
-                        enc = srv->get_keypad_config();
+                        enc = srv->_json_keypad_config;
                         if (crypt)
                             enc = srv->encrypt(enc.c_str());
                         mg_printf(c, PSTR("event: %s\r\ndata: %s\r\n\r\n"), "key_config", enc.c_str());
@@ -3182,9 +3158,8 @@ namespace esphome
             }
 
             handleRequest(c, obj);
-
-           if (c->send.size > 1500 || c->recv.size > 1500)
-               c->is_draining = 1; // if send or recv queue getting too large close the connection to free up ram
+            if (c->send.size > 1500 || c->recv.size > 1500)
+                c->is_draining = 1; // if send or recv queue getting too large close the connection to free up ram
         }
 
         void WebServer::handleRequest(mg_connection *c, JsonObject doc)
@@ -3342,7 +3317,7 @@ namespace esphome
             }
 #endif
 
-
+#if defined(USE_DSC_PANEL) || defined(USE_VISTA_PANEL)
             if (doc["domain"] == "auth")
             {
                 this->handle_auth_request(c, doc);
@@ -3353,7 +3328,7 @@ namespace esphome
                 this->handle_alarm_panel_request(c, doc);
                 return;
             }
-
+#endif
 
 #ifdef USE_ALARM_CONTROL_PANEL
             if (doc["domain"] == "alarm_control_panel")
@@ -3398,7 +3373,7 @@ namespace esphome
             std::string ebuf = escape_json(buf);
             this->push(OTA, ebuf.c_str());
             this->set_timeout(2000, []()
-                              { App.safe_reboot(); });
+                { App.safe_reboot(); });
 #endif
         }
 #if defined(ESP32)

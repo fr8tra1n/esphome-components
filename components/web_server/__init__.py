@@ -25,6 +25,8 @@ from esphome.const import (
     PLATFORM_BK72XX,
     PLATFORM_RTL87XX,
     CONF_NAME,
+    CONF_WEB_SERVER,
+    CONF_WEB_SERVER_ID,
 )
 import os
 import pathlib
@@ -50,11 +52,9 @@ CONF_JSLOCAL="js_local"
 CONF_SORTING_GROUP_ID = "sorting_group_id"
 CONF_SORTING_GROUPS = "sorting_groups"
 CONF_SORTING_WEIGHT = "sorting_weight"
-CONF_WEB_KEYPAD_ID="web_keypad_id"
-CONF_WEB_KEYPAD="web_keypad"
 
-web_keypad_ns = cg.esphome_ns.namespace("web_keypad")
-WebKeypad = web_keypad_ns.class_("WebServer", cg.Component, cg.Controller)
+web_server_ns = cg.esphome_ns.namespace("web_keypad")
+WebServer = web_server_ns.class_("WebServer", cg.Component, cg.Controller)
 
 sorting_groups = {}
 
@@ -91,17 +91,17 @@ sorting_group = {
     cv.Optional(CONF_SORTING_WEIGHT): cv.float_,
 }
 
-WEBKEYPAD_SORTING_SCHEMA = cv.Schema(
+WEBSERVER_SORTING_SCHEMA = cv.Schema(
     {
-        cv.Optional(CONF_WEB_KEYPAD): cv.Schema(
+        cv.Optional(CONF_WEB_SERVER): cv.Schema(
             {
-                cv.OnlyWith(CONF_WEB_KEYPAD_ID, "web_keypad"): cv.use_id(WebKeypad),
+                cv.OnlyWith(CONF_WEB_SERVER_ID, "web_server"): cv.use_id(WebServer),
                 cv.Optional(CONF_SORTING_WEIGHT): cv.All(
-                    cv.requires_component("web_keypad"),
+                    cv.requires_component("web_server"),
                     cv.float_,
                 ),
                 cv.Optional(CONF_SORTING_GROUP_ID): cv.All(
-                    cv.requires_component("web_keypad"),
+                    cv.requires_component("web_server"),
                     cv.use_id(cg.int_),
                 ),
             }
@@ -113,9 +113,9 @@ WEBKEYPAD_SORTING_SCHEMA = cv.Schema(
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
-            cv.GenerateID(): cv.declare_id(WebKeypad),
+            cv.GenerateID(): cv.declare_id(WebServer),
             cv.Optional(CONF_PORT, default=80): cv.port,
-            cv.Optional(CONF_VERSION, default=2): cv.one_of(2,3, int=True),
+            cv.Optional(CONF_VERSION, default=3): cv.one_of(2,3, int=True),
             cv.Optional(CONF_CSS_URL): cv.string,
             cv.Optional(CONF_CSS_INCLUDE): cv.file_,
             cv.Optional(CONF_JS_URL): cv.string,
@@ -176,12 +176,12 @@ def add_sorting_groups(web_server_var, config):
 
 
 async def add_entity_config(entity, config):
-    web_keypad = await cg.get_variable(config[CONF_WEB_KEYPAD_ID])
+    web_server = await cg.get_variable(config[CONF_WEB_SERVER_ID])
     sorting_weight = config.get(CONF_SORTING_WEIGHT, 50)
     sorting_group_hash = hash(config.get(CONF_SORTING_GROUP_ID))
 
     cg.add(
-        web_keypad.add_entity_config(
+        web_server.add_entity_config(
             entity,
             sorting_weight,
             sorting_group_hash,
@@ -242,6 +242,7 @@ async def to_code(config):
     cg.add_define("USE_WEBKEYPAD")
     cg.add_define("USE_WEBKEYPAD_PORT", config[CONF_PORT])
     cg.add_define("USE_WEBKEYPAD_VERSION", version)
+
     
     if lambda_config := config.get(CONF_SERVICE_LAMBDA):
         lambda_ = await cg.process_lambda(

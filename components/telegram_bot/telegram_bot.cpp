@@ -6,23 +6,21 @@
 #include "esphome/core/log.h"
 #include "esphome/core/util.h"
 #include "ArduinoJson.h"
+#include "esphome/components/switch/switch.h"
 #include <cstdlib>
 
 // #define USETASK
 // #define ASYNC_CORE 1
-
-// #if defined(ESP32) && defined(USETASK)
-// #include <esp_chip_info.h>
-// #include <esp_task_wdt.h>
-// #endif
+//  #if defined(ESP32) && defined(USETASK)
+//  #include <esp_chip_info.h>
+//  #include <esp_task_wdt.h>
+//  #endif
 
 #ifdef USE_ARDUINO
 #include <StreamString.h>
 #else
 #define F(x) x
 #define printf_P(fmt, ...) printf(fmt, ##__VA_ARGS__)
-
-
 
 class String : public std::string
 {
@@ -126,15 +124,15 @@ namespace esphome
       outMessage omsg;
       omsg.msg = outmsg;
       omsg.type = out.type;
-      messages.push(omsg);
+      messages_.push(omsg);
     }
 
     bool WebNotify::isAllowed(std::string chat_id)
     {
-      if (std::find(allowed_chat_ids.begin(), allowed_chat_ids.end(), "*") != allowed_chat_ids.end())
+      if (std::find(allowed_chat_ids_.begin(), allowed_chat_ids_.end(), "*") != allowed_chat_ids_.end())
         return true;
 
-      if (std::find(allowed_chat_ids.begin(), allowed_chat_ids.end(), chat_id) != allowed_chat_ids.end())
+      if (std::find(allowed_chat_ids_.begin(), allowed_chat_ids_.end(), chat_id) != allowed_chat_ids_.end())
         return true;
 
       return false;
@@ -177,21 +175,21 @@ namespace esphome
 
                                   int update_id = root["result"][0]["update_id"];
                                   // we ignore the first message on initial start to avoid a reboot loop if ignore_first flag is set
-                                  if (global_notify->skipFirst_ && global_notify->lastMsgReceived == 0) {
+                                  if (global_notify->skipFirst_ && global_notify->lastMsgReceived_ == 0) {
                                      std::string to=root["result"][0]["callback_query"]["message"]["chat"]["id"].as<std::string>();
                                      global_notify->publish(to,"First cmd to bot ignored after restart",1);
-                                     global_notify->lastMsgReceived = update_id;
+                                     global_notify->lastMsgReceived_ = update_id;
                                   }
                                   update_id = update_id + 1;
-                                  if (global_notify->lastMsgReceived != update_id)
+                                  if (global_notify->lastMsgReceived_ != update_id)
                                   {
 
                                     RemoteData x;
-                                    if (global_notify->lastMsgReceived == 0)
+                                    if (global_notify->lastMsgReceived_ == 0)
                                       x.is_first_cmd = true;
                                     else
                                       x.is_first_cmd = false;
-                                    global_notify->lastMsgReceived = update_id;
+                                    global_notify->lastMsgReceived_ = update_id;
                                     x.sender = root["result"][0]["callback_query"]["message"]["from"]["username"].as<std::string>();
                                     x.text = root["result"][0]["callback_query"]["data"].as<std::string>();
                                     x.chat_id = root["result"][0]["callback_query"]["message"]["chat"]["id"].as<std::string>();
@@ -214,9 +212,9 @@ namespace esphome
                                         int update_id = root["result"][0]["update_id"];
                                         update_id = update_id + 1;
                                         //we ignore the first message on initial start to avoid a reboot loop
-                                        if (global_notify->lastMsgReceived == 0) global_notify->lastMsgReceived = update_id;
+                                        if (global_notify->lastMsgReceived_ == 0) global_notify->lastMsgReceived_ = update_id;
 
-                                        if (global_notify->lastMsgReceived != update_id) {
+                                        if (global_notify->lastMsgReceived_ != update_id) {
                                           std::string sender = root["result"][0]["channel_post"]["message"]["from"]["username"];
                                           std::string text = root["result"][0]["channel_post"]["message"]["text"];
                                           std::string chat_id = root["result"][0]["channel_post"]["message"]["chat"]["id"];
@@ -227,7 +225,7 @@ namespace esphome
                                           // m.chat_id = chat_id;
                                           //m.date = date;
                                           // m.is_callback=false;
-                                          global_notify->lastMsgReceived = update_id;
+                                          global_notify->lastMsgReceived_ = update_id;
                                         }
                                   */
                                 }
@@ -237,21 +235,21 @@ namespace esphome
                                   update_id = update_id + 1;
                                   // we ignore the first message on initial start to avoid a reboot loop if ignore_first flag is set
                  
-                                  if (global_notify->skipFirst_ && global_notify->lastMsgReceived == 0) {
+                                  if (global_notify->skipFirst_ && global_notify->lastMsgReceived_ == 0) {
                                      std::string to=root["result"][0]["message"]["chat"]["id"].as<std::string>();
                                      global_notify->publish(to,"First cmd to bot ignored after restart",1);
                                   }
                                   
 
-                                  if (global_notify->lastMsgReceived != update_id)
+                                  if (global_notify->lastMsgReceived_ != update_id)
                                   {
 
                                     RemoteData x;
-                                    if (global_notify->lastMsgReceived == 0)
+                                    if (global_notify->lastMsgReceived_ == 0)
                                       x.is_first_cmd = true;
                                     else
                                       x.is_first_cmd = false;
-                                    global_notify->lastMsgReceived = update_id;
+                                    global_notify->lastMsgReceived_ = update_id;
                                     x.sender = root["result"][0]["message"]["from"]["username"].as<std::string>();
                                     x.text = root["result"][0]["message"]["text"].as<std::string>();
                                     x.chat_id = root["result"][0]["message"]["chat"]["id"].as<std::string>();
@@ -280,11 +278,11 @@ namespace esphome
                                   if (ok)
                                   {
                                     // pop last sent message from queue as it was successful
-                                    global_notify->messages.pop();
+                                    global_notify->messages_.pop();
                                   }
                                   else 
                                   {
-                                    global_notify->retryDelay = millis();
+                                    global_notify->retryDelay_ = millis();
                                      ESP_LOGE(TAG, "Error response from server on last send: %s", payload);
                                   }
                                 } 
@@ -294,20 +292,20 @@ namespace esphome
                                     std::string botname=root["result"]["username"];
                                     global_notify->set_bot_name(botname);
                                     ESP_LOGD(TAG,"Set bot name to %s",botname.c_str());
-                                    global_notify->messages.pop();
+                                    global_notify->messages_.pop();
                                     global_notify->botRequest_=false;
                                   }
 
                                 } 
-                                else if (global_notify->sending)
+                                else if (global_notify->sending_)
                                 {
                                   bool ok = root["ok"];
                                   if (!ok)
                                   {
-                                    global_notify->retryDelay = millis();
+                                    global_notify->retryDelay_ = millis();
                                     ESP_LOGE(TAG, "Error response from server: %s", payload);
-                                    outMessage om=global_notify->messages.front();
-                                    global_notify->messages.pop();
+                                    outMessage om=global_notify->messages_.front();
+                                    global_notify->messages_.pop();
                                     if (om.type==mtGetMe) {
                                       global_notify->botRequest_=false;
                                       ESP_LOGD(TAG,"removed pending bot name request");
@@ -318,14 +316,14 @@ namespace esphome
                                 else if (root["result"][0]["update_id"])
                                 {
                                   int update_id = root["result"][0]["update_id"];
-                                  global_notify->lastMsgReceived = update_id + 1;
+                                  global_notify->lastMsgReceived_ = update_id + 1;
                                 }
                                 else
                                 {
                                   bool ok = root["ok"];
                                   if (!ok)
                                   {
-                                    global_notify->retryDelay = millis();
+                                    global_notify->retryDelay_ = millis();
                                     ESP_LOGE(TAG, "Error response from server: %s", payload);
                                   }
                                 }
@@ -345,30 +343,35 @@ namespace esphome
       {
         c->send.c = c;
         c->recv.c = c;
-        global_notify->connected = true;
+        global_notify->connected_ = true;
         // Connection created. Store connect expiration time in c->data
-        *(uint64_t *)&c->data[2] = mg_millis() + global_notify->timeout_ms;
+        //*(uint64_t *)&c->data[2] = mg_millis() + global_notify->timeout_ms;
       }
       else if (ev == MG_EV_POLL)
       {
 
-        if ((c->is_connecting || c->is_resolving) && mg_millis() > *(uint64_t *)&c->data[2])
-        {
-          mg_error(c, "Connect timeout");
-        }
         if (c->data[0] == 'T')
         {
-          if (!global_notify->sending && !c->is_draining && !c->is_closing && (!global_notify->enableBot_ || global_notify->messages.size()))
+
+          if (!global_notify->sending_ && !c->is_draining && !c->is_closing)
           {
-            c->is_draining = 1; // close long poll so we can send
+            if (millis() > *(uint64_t *)&c->data[2])
+            {
+              ESP_LOGE(TAG, "Long poll timeout. Retrying...");
+              c->is_closing=1;
+            }
+            else if ((!global_notify->enableBot_ || global_notify->messages_.size()))
+            {
+              c->is_draining = 1; // close long poll so we can send
+            }
           }
         }
       }
       else if (ev == MG_EV_CLOSE)
       {
-        global_notify->sending = false;
-        global_notify->connected = false;
-        // MG_INFO(("Got ev close,enablebot %d, ma %d, sending=%d",global_notify->enableBot_, global_notify->messages.size(),global_notify->sending));
+        global_notify->sending_ = false;
+        global_notify->connected_ = false;
+        // MG_INFO(("Got ev close,enablebot %d, ma %d, sending_=%d",global_notify->enableBot_, global_notify->messages_.size(),global_notify->sending_));
       }
       else if (ev == MG_EV_CONNECT)
       {
@@ -380,58 +383,75 @@ namespace esphome
           // ESP_LOGD("test","Pending message closing poll connection from connect");
           return;
         }
-        c->data[0] = 'T';
-        global_notify->connected = true;
+
         // MG_INFO(("got ev connect"));
         // Connected to server. Extract host name from URL
         struct mg_str host = mg_url_host(global_notify->apiHost_.c_str());
 
         if (mg_url_is_ssl(global_notify->apiHost_.c_str()))
         {
-          ESP_LOGD(TAG, "TLS init - Before: freeheap: %5d,minheap: %5d,maxfree:%5d\n", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
+          ESP_LOGD(TAG, "TLS init - Before: freeheap: %5d,minheap: %5d,maxfree:%5d", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
           struct mg_tls_opts opts = {.name = host};
           mg_tls_init(c, &opts);
-          if (c->tls == NULL) {
-            global_notify->retryDelay = millis();
+          if (c->tls == NULL)
+          {
+            mg_error(c, "TLS init error");
             return;
           }
         }
+        c->data[0] = 'T';
+        global_notify->connected_ = true;
+        global_notify->connectError_ = false;
+        global_notify->connectErrorMessage_= "Connected";
 
-        ESP_LOGD(TAG, "TLS init - After: freeheap: %5d,minheap: %5d,maxfree:%5d\n", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
+        *(uint64_t *)&c->data[2] = millis() + (global_notify->pollTimeout_ * 1000); // set  long poll timeout
 
-        if (global_notify->messages.size())
+        ESP_LOGD(TAG, "TLS init - After: freeheap: %5d,minheap: %5d,maxfree:%5d", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
+
+        if (global_notify->messages_.size())
         {
-          global_notify->sending = true; // we are connecting so flag connection as open
+          global_notify->sending_ = true; // we are connecting so flag connection as open
 
-          outMessage outmsg = global_notify->messages.front();
+          outMessage outmsg = global_notify->messages_.front();
 
-          mg_printf(c, "POST /bot%s", global_notify->botId_.c_str());
-          if (outmsg.type == mtEditMessageText)
-            mg_printf(c, "/editMessageText HTTP/1.1\r\n");
-          else if (outmsg.type == mtAnswerCallbackQuery)
-            mg_printf(c, "/answerCallbackQuery HTTP/1.1\r\n");
-          else if (outmsg.type == mtEditMessageReplyMarkup)
-            mg_printf(c, "/editMessageReplyMarkup HTTP/1.1\r\n");
-          else if (outmsg.type == mtDeleteMessage)
-            mg_printf(c, "/deleteMessage HTTP/1.1\r\n");
-          else if (outmsg.type == mtGetMe)
-            mg_printf(c, "/getMe HTTP/1.1\r\n");
+          if (outmsg.type == mtSwitch)
+          {
+            global_notify->messages_.pop();
+            if (outmsg.state)
+              static_cast<switch_::Switch *>(outmsg.f)->turn_on();
+            else
+              static_cast<switch_::Switch *>(outmsg.f)->turn_off();
+          }
           else
-            mg_printf(c, "/sendMessage HTTP/1.1\r\n");
-          mg_printf(c, "Host: %.*s\r\n", host.len, host.buf);
-          mg_printf(c, "Content-Type: application/json\r\n");
-          mg_printf(c, "Content-Length: %d\r\n\r\n%s\r\n", outmsg.msg.length(), outmsg.msg.c_str());
-          // printf("\r\nsent telegram msg %s\r\n",outmsg.msg.c_str());
+          {
+            mg_printf(c, "POST /bot%s", global_notify->botId_.c_str());
+            if (outmsg.type == mtEditMessageText)
+              mg_printf(c, "/editMessageText HTTP/1.1\r\n");
+            else if (outmsg.type == mtAnswerCallbackQuery)
+              mg_printf(c, "/answerCallbackQuery HTTP/1.1\r\n");
+            else if (outmsg.type == mtEditMessageReplyMarkup)
+              mg_printf(c, "/editMessageReplyMarkup HTTP/1.1\r\n");
+            else if (outmsg.type == mtDeleteMessage)
+              mg_printf(c, "/deleteMessage HTTP/1.1\r\n");
+            else if (outmsg.type == mtGetMe)
+              mg_printf(c, "/getMe HTTP/1.1\r\n");
+            else
+              mg_printf(c, "/sendMessage HTTP/1.1\r\n");
+            mg_printf(c, "Host: %.*s\r\n", host.len, host.buf);
+            mg_printf(c, "Content-Type: application/json\r\n");
+            mg_printf(c, "Content-Length: %d\r\n\r\n%s\r\n", outmsg.msg.length(), outmsg.msg.c_str());
+            // printf("\r\nsent telegram msg %s\r\n",outmsg.msg.c_str());
+          }
         }
         else if (global_notify->enableBot_)
         {
-          global_notify->sending = false;
+          global_notify->sending_ = false;
           mg_printf(c, "GET /bot%s", global_notify->botId_.c_str());
-          mg_printf(c, "/getUpdates?limit=1&timeout=120&offset=%d HTTP/1.1\r\n", global_notify->lastMsgReceived);
+          mg_printf(c, "/getUpdates?limit=1&timeout=%d&offset=%d HTTP/1.1\r\n", global_notify->pollTimeout_, global_notify->lastMsgReceived_);
           mg_printf(c, "Host: %.*s\r\n", host.len, host.buf);
           mg_printf(c, "Accept: application/json\r\n");
           mg_printf(c, "Cache-Control: no-cache\r\n\r\n");
-          // ESP_LOGD("test","sent post data lastmessage=%d",global_notify->lastMsgReceived);
+          // ESP_LOGD("test","sent post data lastmessage=%d",global_notify->lastMsgReceived_);
         }
       }
       /*
@@ -439,10 +459,10 @@ namespace esphome
          ESP_LOGD(TAG,"data 1a= %d",*i);
          *i=0;
          struct mg_str host = mg_url_host(global_notify->apiHost_.c_str());
-         if (global_notify->messages.size()) {
-          global_notify->sending=true;       //we are connecting so flag connection as open
+         if (global_notify->messages_.size()) {
+          global_notify->sending_=true;       //we are connecting so flag connection as open
 
-          outMessage outmsg=global_notify->messages.front();
+          outMessage outmsg=global_notify->messages_.front();
 
           mg_printf(c,"POST /bot%s",global_notify->botId_.c_str());
           if (outmsg.type==mtEditMessageText)
@@ -460,13 +480,13 @@ namespace esphome
           mg_printf(c,"Content-Length: %d\r\n\r\n%s\r\n",outmsg.msg.length(),outmsg.msg.c_str());
           // printf("\r\nsent telegram msg %s\r\n",outmsg.msg.c_str());
         } else if ( global_notify->enableBot_) {
-          global_notify->sending=false;
+          global_notify->sending_=false;
           mg_printf(c,"GET /bot%s",global_notify->botId_.c_str());
-          mg_printf(c,"/getUpdates?limit=1&timeout=120&offset=%d HTTP/1.1\r\n",global_notify->lastMsgReceived);
+          mg_printf(c,"/getUpdates?limit=1&timeout=120&offset=%d HTTP/1.1\r\n",global_notify->lastMsgReceived_);
           mg_printf(c,"Host: %.*s\r\n",host.len,host.buf);
           mg_printf(c,"Accept: application/json\r\n");
           mg_printf(c,"Cache-Control: no-cache\r\n\r\n");
-          // ESP_LOGD("test","sent post data lastmessage=%d",global_notify->lastMsgReceived);
+          // ESP_LOGD("test","sent post data lastmessage=%d",global_notify->lastMsgReceived_);
         }
       } */
       else if (ev == MG_EV_HTTP_MSG)
@@ -477,11 +497,11 @@ namespace esphome
         // printf("\r\nresponse message from telegram: %.*s\r\n", (int) hm->message.len, hm->message.buf);
 
         String payload = String(hm->body.buf, hm->body.len);
-       //  printf("\r\nresponse body from telegram: %s\r\n", payload.c_str());
+        //  printf("\r\nresponse body from telegram: %s\r\n", payload.c_str());
         if (!payload.length() || !global_notify->processMessage(payload.c_str()))
         {
-          global_notify->retryDelay = millis();
-          ESP_LOGE(TAG,"Message parsing failed, skipped.");
+          global_notify->retryDelay_ = millis();
+          ESP_LOGE(TAG, "Message parsing failed, skipped.");
           int update_id_first_digit = 0;
           int update_id_last_digit = 0;
           for (int a = 0; a < 3; a++)
@@ -492,15 +512,17 @@ namespace esphome
           {
             update_id_last_digit = payload.indexOf(',', update_id_last_digit + 1);
           }
-          global_notify->lastMsgReceived = payload.substring(update_id_first_digit + 1, update_id_last_digit).toInt() + 1;
+          global_notify->lastMsgReceived_ = payload.substring(update_id_first_digit + 1, update_id_last_digit).toInt() + 1;
         }
-        global_notify->sending = false;
+        global_notify->sending_ = false;
         c->is_closing = 1; // Tell mongoose to close this connection
       }
       else if (ev == MG_EV_ERROR)
       {
-        global_notify->retryDelay = millis();
-        ESP_LOGE(TAG, "MG_EV_ERROR occured. Retrying in %d seconds.", global_notify->delayTime/1000);
+        global_notify->retryDelay_ = millis();
+        global_notify->connectError_ = true;
+        global_notify->connectErrorMessage_= std::string((char *)ev_data);
+        ESP_LOGE(TAG, "MG_EV_ERROR %lu %ld %s. Retrying in %d seconds.", c->id, c->fd, (char *)ev_data, global_notify->delayTime_ / 1000);
       }
     }
 
@@ -512,7 +534,7 @@ namespace esphome
     //       static unsigned long checkTime = millis();
     //       for (;;)
     //       {
-    //               mg_mgr_poll(&(global_notify->mgr), 1);
+    //               mg_mgr_poll(&(global_notify->mgr_), 1);
 
     //               vTaskDelay(4 / portTICK_PERIOD_MS);
     // #if not defined(ARDUINO_MQTT)
@@ -527,8 +549,6 @@ namespace esphome
     //       vTaskDelete(NULL);
     //     }
     // #endif
-
- 
 
     void WebNotify::setup()
     {
@@ -553,12 +573,12 @@ namespace esphome
       }
       ESP_LOGD(TAG, "chat id=[%s],bot id=[%s]", telegramUserId_.c_str(), botId_.c_str());
 
-      mg_mgr_init(&mgr);
+      mg_mgr_init(&mgr_);
       // std::string msg="{\"chat_id\":"+std::string(telegramUserId_.c_str())+",\"text\":\"Esphome Telegram client started.\"}";
       // outMessage out;
       // out.msg=msg;
       // out.type=mtSendMessage;
-      // messages.push(out);
+      // messages_.push(out);
 
       // #if defined(ESP32) && defined(USETASK)
       //       esp_chip_info_t info;
@@ -568,7 +588,7 @@ namespace esphome
       //       xTaskCreatePinnedToCore(
       //           this->telegramTask, // Function to implement the task
       //           "telegramTask",     // Name of the task
-      //           3200,               // Stack size in words
+      //           16000,               // Stack size
       //           (void *)this,       // Task input parameter
       //           12,                 // Priority of the task
       //           &xHandle            // Task handle.
@@ -581,23 +601,22 @@ namespace esphome
     void WebNotify::loop()
     {
       static bool firstRun = true;
-
       if (network::is_connected())
       {
-        if (!connected && ((enableBot_ && botId_.length() > 0) || (messages.size() && enableSend_)) && ((millis() - retryDelay) > delayTime  || firstRun))
+        if (!connected_ && ((enableBot_ && botId_.length() > 0) || (messages_.size() && enableSend_)) && ((millis() - retryDelay_) > delayTime_ || firstRun))
         {
           ESP_LOGD(TAG, "Connecting to telegram...");
-
-          mg_http_connect(&mgr, apiHost_.c_str(), notify_fn, &c_res); // Create client connection
+          mg_http_connect(&mgr_, apiHost_.c_str(), notify_fn, &c_res_); // Create client connection
           if (botName_ == "" && !botRequest_)
           {
             outMessage out;
             out.type = mtGetMe;
-            messages.push(out);
+            messages_.push(out);
             botRequest_ = true;
           }
           firstRun = false;
         }
+
       }
 
       static unsigned long checkTime = millis();
@@ -607,8 +626,11 @@ namespace esphome
         UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
         ESP_LOGD(TAG, "Stack high water mark: %5d", (uint16_t)uxHighWaterMark);
       }
+      taskYIELD();
+      // #if !defined(USETASK)
+      mg_mgr_poll(&mgr_, 0);
 
-      mg_mgr_poll(&mgr, 0);
+      // #endif
     }
 
     void WebNotify::dump_config()

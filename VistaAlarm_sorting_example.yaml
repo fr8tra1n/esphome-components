@@ -116,34 +116,20 @@ esp32:
 external_components:
   - source: github://Dilbert66/esphome-components@dev #uncomment to use github repository
   #- source:  my_components #uncomment to use local directory  
-    components: [vista_alarm_panel,web_keypad,mg_lib] 
+    components: [vista_alarm_panel,web_server,mg_lib] 
     refresh: 10min
     
 ## web keypad component
-## Each included files will be downloaded automatically and compiled within the flash.  
-## There will be no need for internet access when running. 
+## each included files will be downloaded automatically and compiled within the flash.  
+## there will be no need for internet access when running. 
 #For www.js build details and source: https://github.com/Dilbert66/esphome-webserver-custom/tree/keypad
 #Component source: https://github.com/Dilbert66/esphome-components/tree/keypad/components/web_keypad
 ### Note: this is an ESP32 only component. The esp8266 does not support the resources needed.
 
-web_keypad:
+web_server:
   port: 80 
   partitions: 1  # a keypad will be shown for each partition
   log: false
-  version: 3
-  sorting_groups:
-    - id: zones
-      name: "Zones"
-      sorting_weight: -4
-    - id: partition1
-      name: "Partition 1"
-      sorting_weight: -3
-    - id: partition2
-      name: "Partition 2"
-      sorting_weight: -2
-    - id: partition3
-      name: "Partition 3"
-      sorting_weight: -1
   auth:          #this section is optional. Enable if you need authentication/encryption
     username: test
     password: test
@@ -151,9 +137,24 @@ web_keypad:
                       #set to false to use Digest authentication - no encryption
   config_url: https://dilbert66.github.io/config_files/config_vista.yml
   js_url: https://dilbert66.github.io/js_files/www_v3.js
+  version: 3
+  sorting_groups:
+    - id: partition1
+      name: "Partition 1 Status"
+      sorting_weight: 1
+    - id: partition2
+      name: "Partition 2 Status"
+      sorting_weight: 2
+    - id: panel
+      name: "Panel Status"
+      sorting_weight: 3
+    - id: zones
+      name: "Zones"
+      sorting_weight: 4
+
   ## If you prefer to use locally hosted compile time files comment two lines above and uncomment below  
   #config_local: ./config_vista.yml     
-  #js_local: ./www_v3.js    
+  #js_local: ./www.js    
    ## custom function call to send keypresses if other than dsc/vista components are used. Parmeters are a string keys and int partition
   #service_lambda: |- 
       #$panelId->alarm_keypress_partition(keys,partition);    
@@ -235,55 +236,81 @@ binary_sensor:
     id: z1  
     name: "Front door z1"
     device_class: door
-# example sorting group options. See Esphome web server sorting group documentation.
-#    web_keypad:
-#      sorting_group_id: zones
-#      sorting_weight: 1
+    web_server:
+      sorting_weight: 1
+      sorting_group_id: zones
 
   - platform: vista_alarm_panel
     id: z2
     name: "Garage door z2"
-    device_class: door   
+    device_class: door 
+    web_server:
+      sorting_weight: 2
+      sorting_group_id: zones  
 
   - platform: vista_alarm_panel
     name: "Back door z3"
     id: z3
     device_class: door  
+    web_server:
+      sorting_weight: 3
+      sorting_group_id: zones
   
   - platform: vista_alarm_panel
     id: z4
     name: "Living room window z4"
-    device_class: window   
+    device_class: window  
+    web_server:
+      sorting_weight: 4
+      sorting_group_id: zones 
  
   - platform: vista_alarm_panel
     id: z5
     name: "Dining room window z5"
-    device_class: window      
+    device_class: window  
+    web_server:
+      sorting_weight: 5
+      sorting_group_id: zones    
 
   - platform: vista_alarm_panel
     id: z6
     name: "Family room window LF z6"
-    device_class: window     
+    device_class: window 
+    web_server:
+      sorting_weight: 6
+      sorting_group_id: zones    
  
   - platform: vista_alarm_panel
     id: z7  
     name: "Family room window RF z7"
-    device_class: window    
+    device_class: window  
+    web_server:
+      sorting_weight: 7
+      sorting_group_id: zones  
 
   - platform: vista_alarm_panel
     id: z8
     name: "Basement windows z8"
-    device_class: window   
+    device_class: window 
+    web_server:
+      sorting_weight: 8
+      sorting_group_id: zones  
 
   - platform: vista_alarm_panel
     id: z10  
     name: "Basement windows z10"
-    device_class: window  
+    device_class: window 
+    web_server:
+      sorting_weight: 10
+      sorting_group_id: zones 
 
   - platform: vista_alarm_panel
     id: z17  
     name: "zone 17 z17"
-    device_class: window   
+    device_class: window  
+    web_server:
+      sorting_weight: 17
+      sorting_group_id: zones 
   
 # you can also add fields to show fault statuses of other devices you have.  The id will be 1 + device address.  
 
@@ -292,18 +319,27 @@ binary_sensor:
     id: z112    
     name: "check relay 12"  
     device_class: problem
+    web_server:
+      sorting_weight: 112
+      sorting_group_id: zones
 
 #zone expander device addresses are 07/08/09/10/11
   - platform: vista_alarm_panel
     id: z108    
     name: "check expander 08"  
     device_class: problem
+    web_server:
+      sorting_weight: 108
+      sorting_group_id: zones
 
 #comm device address such as Alarmnet/LRR is 03
   - platform: vista_alarm_panel
     id: z103    
     name: "check comm device"  
     device_class: problem
+    web_server:
+      sorting_weight: 103
+      sorting_group_id: zones
      
 ### non zone sensors ###
 
@@ -312,11 +348,17 @@ binary_sensor:
   - platform: vista_alarm_panel
     id: rdy_1
     name: "Ready partiton 1"
+    web_server:
+      sorting_weight: 1
+      sorting_group_id: partition1
 
 #Partition 2 example
   - platform: vista_alarm_panel
     id: rdy_2
-    name: "Ready partition 2"  
+    name: "Ready partition 2"
+    web_server:
+      sorting_weight: 1
+      sorting_group_id: partition2  
 
 # partition/panel trouble status 
 # trouble id code = trbl_ + partition number
@@ -324,34 +366,51 @@ binary_sensor:
     id: trbl_1
     name: "Trouble partition 1"
     device_class: problem
+    web_server:
+      sorting_weight: 2
+      sorting_group_id: partition1
 
 #Partition 2 example
   - platform: vista_alarm_panel
     id: trbl_2
     name: "Trouble partition 2"
-    device_class: problem   
+    device_class: problem 
+    web_server:
+      sorting_weight: 2
+      sorting_group_id: partition2
  
 # bypass zones active status
 # bypass id code = byp_ + partition number   
   - platform: vista_alarm_panel
     id: byp_1
     name: "Bypass partition 1"
+    web_server:
+      sorting_weight: 3
+      sorting_group_id: partition1
 
 #Partition 2 example
   - platform: vista_alarm_panel
     id: byp_2
     name: "Bypass partition 2"
+    web_server:
+      sorting_weight: 3
+      sorting_group_id: partition2
 
 # armed away status
 # armed away id code = arma_ + partition number 
   - platform: vista_alarm_panel
-    id: arma_1
     name: "Away partition 1"
+    web_server:
+      sorting_weight: 4
+      sorting_group_id: partition1
 
 #Partition 2 example
   - platform: vista_alarm_panel
     id: arma_2
     name: "Away partition 2"
+    web_server:
+      sorting_weight: 4
+      sorting_group_id: partition2
  
 # armed status 
 # armed id code = arm_ + partition number
@@ -361,7 +420,7 @@ binary_sensor:
 
 #Partition 2 example
   - platform: vista_alarm_panel
-    id: arm_2  
+    id: arma_1  
     name: "Armed partition 2" 
   
 # armed stay status
@@ -394,8 +453,8 @@ binary_sensor:
 
 #Partition 2 example
   - platform: vista_alarm_panel
-    id: armn_2
-    name: "Night partition 2"   
+    id: armi_2
+    name: "Instant partition 2"   
  
 # ac status
 # ac id code = (ac)     
@@ -432,6 +491,9 @@ binary_sensor:
     id: bat  
     name: "Battery Status"
     device_class: problem
+    web_server:
+      sorting_weight: 1
+      sorting_group_id: panel
 
 # fire alarm status
 # fire alarm id code = fire_ + partition number     
@@ -463,7 +525,10 @@ text_sensor:
 # zone id code = z+zone number
   - platform: vista_alarm_panel
     name: "Front door zone z1"
-    id: z1s messages
+    id: z1x
+    web_server:
+      sorting_weight: 21
+      sorting_group_id: zones
 
 # system status messages
 # system status id code = ss_ + partition number  
@@ -495,7 +560,10 @@ text_sensor:
   - platform: vista_alarm_panel
     id: rf  
     name: "RF Msg"
-    icon: "mdi:alert-box"    
+    icon: "mdi:alert-box"  
+    web_server:
+      sorting_weight: 2
+      sorting_group_id: panel  
 
 # virtual lcd keypad line1 and line2 messages for each partition   
 # partition line1 id code = ln1_ + partition number
@@ -521,6 +589,9 @@ text_sensor:
   - platform: vista_alarm_panel
     name: "Zone Status" 
     id: zs
+    web_server:
+      sorting_weight: 4
+      sorting_group_id: panel
 
 # system beeps
 # beeps id code = bp_ + partition number     

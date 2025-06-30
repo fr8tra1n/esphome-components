@@ -2,8 +2,7 @@
 
 #include "Arduino.h"
 
-//#include "esp_task_wdt.h"
-
+// #include "esp_task_wdt.h"
 
 Vista *pointerToVistaClass;
 
@@ -30,6 +29,7 @@ Vista::Vista()
   outbufIdx = 0;
   incmdIdx = 0;
   outcmdIdx = 0;
+  moduleIdx = 0;
   rxState = sNormal;
   pointerToVistaClass = this;
   cbuf = new char[CMDBUFSIZE];
@@ -38,6 +38,7 @@ Vista::Vista()
   cmdQueue = new cmdQueueItem[CMDQUEUESIZE];
   faultQueue = new uint8_t[FAULTQUEUESIZE];
   lrrSupervisor = false;
+  filterOwnTx=false;
 }
 
 Vista::~Vista()
@@ -80,7 +81,7 @@ void Vista::setNextFault(uint8_t idx)
 
 void Vista::readChars(int ct, char buf[], int *idx)
 {
- 
+
   int x = 0;
   int idxval = *idx;
   unsigned long timeout = millis();
@@ -89,11 +90,12 @@ void Vista::readChars(int ct, char buf[], int *idx)
     if (vistaSerial->available())
     {
       timeout = millis();
-       buf[idxval++] = vistaSerial->read();
+      buf[idxval++] = vistaSerial->read();
       x++;
-    } 
+    }
 #ifdef ESP32
-    else vTaskDelay(5);
+    else
+      vTaskDelay(5);
 #else
     delayMicroseconds(4);
 #endif
@@ -188,16 +190,11 @@ void Vista::onDisplay(char cbuf[], int *idx)
   statusFlags.night = ((cbuf[6] & BIT_MASK_BYTE1_NIGHT) > 0);
   statusFlags.armedStay = ((cbuf[7] & BIT_MASK_BYTE2_ARMED_HOME) > 0);
 
-  // if (statusFlags.systemFlag)
-  //{
   statusFlags.lowBattery = ((cbuf[7] & BIT_MASK_BYTE2_LOW_BAT) > 0);
   // statusFlags.acLoss = ((cbuf[7] & BIT_MASK_BYTE2_UNKNOWN) > 0);
-  //}
-  // else
-  //{
+
   statusFlags.check = ((cbuf[7] & BIT_MASK_BYTE2_CHECK_FLAG) > 0);
-  statusFlags.fireZone = ((cbuf[7] & BIT_MASK_BYTE2_ALARM_ZONE) > 0);
-  //}
+  statusFlags.fireZone = ((cbuf[7] & BIT_MASK_BYTE2_ZONE_FIRE) > 0);
 
   statusFlags.inAlarm = ((cbuf[8] & BIT_MASK_BYTE3_IN_ALARM) > 0);
   statusFlags.acPower = ((cbuf[8] & BIT_MASK_BYTE3_AC_POWER) > 0);
@@ -257,23 +254,29 @@ bool Vista::cmdAvail()
     return true;
 }
 
-void Vista::pushCmdQueueItem()
+void Vista::pushCmdQueueItem(size_t size, size_t rawsize)
 {
   struct cmdQueueItem q;
   q.statusFlags = statusFlags;
   q.newCmd = newCmd;
   q.newExtCmd = newExtCmd;
+  q.size = size;
+  q.rawsize = rawsize;
 
   if (newExtCmd)
   {
-    for (uint8_t i = 0; i < OUTBUFSIZE; i++)
+    for (uint8_t i = 0; i < size; i++)
     {
       q.cbuf[i] = extcmd[i];
+    }
+    for (uint8_t i = 0; i < rawsize; i++)
+    {
+      q.extbuf[i] = extbuf[i];
     }
   }
   else
   {
-    for (uint8_t i = 0; i < CMDBUFSIZE; i++)
+    for (uint8_t i = 0; i < size; i++)
     {
       q.cbuf[i] = cbuf[i];
     }
@@ -296,25 +299,39 @@ void Vista::pushCmdQueueItem()
  */
 void Vista::onLrr(char cbuf[], int *idx)
 {
+  //response to a f9 resend. Send back last message
+  if (_retriesf9 > 0 && _retriesf9 < 4)
+  {
+    if (peekNextKpAddr() == LRRADDR)
+      getChar(); //remove last request
+    sending = true;
+    delayMicroseconds(500);
+    for (uint8_t x = 0; x < _lcbuflen; x++)
+    {
+      vistaSerial->write(lcbuf[x]);
+    }
+    expectByte = lcbuf[0];
+    expectCmd = 0xf9;
+    _retriesf9++;
+    sending = false;
+    return;
+  }
 
+  _retriesf9 = 0;
   int len = cbuf[2];
+  _lcbuflen = 0;
 
   if (len == 0)
     return;
-  sending = true;
   char type = cbuf[3];
-  char lcbuf[12];
-  int lcbuflen = 0;
 
   // 0x52 means respond with only cycle message
   // 0x48 means same thing
   //, i think 0x52 and and 0x48 are the same
-  if (type == (char)0x52 || type == (char)0x48
-
-  )
+  if (type == (char)0x52 || type == (char)0x48)
   {
     lcbuf[0] = (char)cbuf[1];
-    lcbuflen++;
+    _lcbuflen++;
   }
   else if (type == (char)0x58)
   {
@@ -323,16 +340,14 @@ void Vista::onLrr(char cbuf[], int *idx)
     c = toDec(c); // convert to decimal representation for correct code display
     statusFlags.lrr.qual = (uint8_t)(0xf0 & cbuf[8]) >> 4;
     statusFlags.lrr.code = c;
-    statusFlags.lrr.zone = toDec(((uint8_t)cbuf[12] >> 4) | ((uint8_t)cbuf[11] << 4));
-    statusFlags.lrr.user = statusFlags.lrr.zone;
+    statusFlags.lrr.data = toDec(((uint8_t)cbuf[12] >> 4) | ((uint8_t)cbuf[11] << 4));
     statusFlags.lrr.partition = (uint8_t)cbuf[10];
 
     lcbuf[0] = (char)(cbuf[1]);
-    lcbuflen++;
+    _lcbuflen++;
   }
   else if (type == (char)0x53)
   {
-
     lcbuf[0] = (char)((cbuf[1] + 0x40) & 0xFF);
     lcbuf[1] = (char)0x04;
     lcbuf[2] = (char)0x00;
@@ -342,36 +357,51 @@ void Vista::onLrr(char cbuf[], int *idx)
     // 0x04 if you have network problems?
     // 0x06 if you have network problems?
     lcbuf[4] = (char)0x00;
-    lcbuflen = 5;
+    _lcbuflen = 5;
     expectByte = lcbuf[0];
+    expectCmd = 0xf9;
+    _retriesf9++;
   }
 
   // we don't need a checksum for 1 byte messages (no length bit)
   // if we don't even have a message length byte, then we are just
   //  ACKing a cycle header byte.
-  if (lcbuflen >= 2)
+  if (_lcbuflen >= 2)
   {
     uint32_t chksum = 0;
-    for (int x = 0; x < lcbuflen; x++)
+    for (int x = 0; x < _lcbuflen; x++)
     {
       chksum += lcbuf[x];
     }
     chksum -= 1;
     chksum = chksum ^ 0xFF;
-    lcbuf[lcbuflen] = (char)chksum;
-    lcbuflen++;
+    lcbuf[_lcbuflen] = (char)chksum;
+    _lcbuflen++;
   }
 
   if (lrrSupervisor)
   {
-   // delayMicroseconds(500);
-    vistaSerial->setBaud(4800);
-    for (int x = 0; x < lcbuflen; x++)
+    sending = true;
+    delayMicroseconds(500);
+    for (int x = 0; x < _lcbuflen; x++)
     {
       vistaSerial->write(lcbuf[x]);
     }
+    sending = false;
   }
-  sending = false;
+}
+
+// add new expander modules and init zone fields
+void Vista::addModule(uint8_t addr)
+{
+  if (!addr)
+    return;
+  if (moduleIdx < MAX_MODULES)
+  {
+    zoneExpanders[moduleIdx] = expanderType_INIT;
+    zoneExpanders[moduleIdx].expansionAddr = addr;
+    moduleIdx++;
+  }
 }
 
 void Vista::setExpFault(int zone, bool fault)
@@ -381,68 +411,48 @@ void Vista::setExpFault(int zone, bool fault)
   // expander address 9 - zones: 25 - 32
   // expander address 10 - zones: 33 - 40
   // expander address 11 - zones: 41 - 48
-  uint8_t idx = 0;
-  expansionAddr = 0;
-  for (uint8_t i = 0; i < MAX_MODULES; i++)
+  uint8_t addr = 0;
+  if (zone > 8 && zone < 17)
   {
-    switch (zoneExpanders[i].expansionAddr)
-    {
-    case 7:
-      if (zone > 8 && zone < 17)
-      {
-        idx = i;
-        expansionAddr = zoneExpanders[i].expansionAddr;
-      }
-      break;
-    case 8:
-      if (zone > 16 && zone < 25)
-      {
-        idx = i;
-        expansionAddr = zoneExpanders[i].expansionAddr;
-      }
-      break;
-    case 9:
-      if (zone > 24 && zone < 33)
-      {
-        idx = i;
-        expansionAddr = zoneExpanders[i].expansionAddr;
-      }
-      break;
+    addr = 7;
+  }
+  else if (zone > 16 && zone < 25)
+  {
+    addr = 8;
+  }
+  else if (zone > 24 && zone < 33)
+  {
+    addr = 9;
+  }
+  else if (zone > 32 && zone < 41)
+  {
+    addr = 10;
+  }
+  else if (zone > 40 && zone < 49)
+  {
+    addr = 11;
+  }
+  else
+    return;
 
-    case 10:
-      if (zone > 32 && zone < 41)
-      {
-        idx = i;
-        expansionAddr = zoneExpanders[i].expansionAddr;
-      }
-      break;
-
-    case 11:
-      if (zone > 40 && zone < 49)
-      {
-        idx = i;
-        expansionAddr = zoneExpanders[i].expansionAddr;
-      }
-      break;
-    default:
-      break;
-    }
-    if (expansionAddr)
+  uint8_t idx;
+  for (idx = 0; idx < moduleIdx; idx++)
+  {
+    if (zoneExpanders[idx].expansionAddr == addr)
       break;
   }
-  if (!expansionAddr)
+
+  if (idx == moduleIdx)
     return;
+
   expFaultBits = zoneExpanders[idx].expFaultBits;
 
-  int z = zone % 8;                      // convert zone to range of 1 - 7,0 (last zone is 0)
-  expFault = z << 5 | (fault ? 0x8 : 0); // 0 = terminated(eol resistor), 0x08=open, 0x10 = closed (shorted)  - convert to bitfield for F1 response
-  if (z > 0)
-    z--;
-  else
-    z = 7;                                                                                   // now convert to 0 - 7 for F7 poll response
-  expFaultBits = (fault ? expFaultBits | (0x80 >> z) : expFaultBits & ((0x80 >> z) ^ 0xFF)); // setup bit fields for return response with fault values for each zone
+  int z = zone & 0x07;                                                            // convert zone to range of 1 - 7,0 (last zone is 0)
+  expFault = z << 5 | (fault ? 0x8 : 0);                                          // 0 = terminated(eol resistor), 0x08=open, 0x10 = closed (shorted)  - convert to bitfield for F1 response
+  z = (zone - 1) & 0x07;                                                          // now convert to 0 - 7 for F7 poll response
+  expFaultBits = fault ? expFaultBits | (0x80 >> z) : expFaultBits ^ (0x80 >> z); // setup bit fields for return response with fault values for each zone
   expanderType lastFault = peekNextFault();
-  if (lastFault.expansionAddr != expansionAddr || lastFault.expFault != expFault || lastFault.expFaultBits != expFaultBits)
+  if (lastFault.expansionAddr != zoneExpanders[idx].expansionAddr || lastFault.expFault != expFault || lastFault.expFaultBits != expFaultBits)
   {
     zoneExpanders[idx].expFault = expFault;
     zoneExpanders[idx].expFaultBits = expFaultBits;
@@ -464,43 +474,40 @@ void Vista::onExp(char cbuf[])
 
   char type = cbuf[4];
   char seq = cbuf[3];
-  char lcbuf[4];
+  char lcbuf[6];
   sending = true;
-
-  int idx;
+  char expansionAddr = 0;
+  uint8_t idx;
 
   if (cbuf[2] & 1)
   {
     seq = cbuf[4];
     type = cbuf[5];
-    for (idx = 0; idx < MAX_MODULES; idx++)
+    for (idx = 0; idx < moduleIdx; idx++)
     {
       expansionAddr = zoneExpanders[idx].expansionAddr;
-      if (!expansionAddr)
-        continue;
       if (cbuf[2] == (0x01 << (expansionAddr - 13)))
-        break; // for us - relay addresses 14-15
+        break; // for relay addresses 14-15
     }
   }
   else
   {
-    for (idx = 0; idx < MAX_MODULES; idx++)
+    for (idx = 0; idx < moduleIdx; idx++)
     {
       expansionAddr = zoneExpanders[idx].expansionAddr;
-      if (!expansionAddr)
-        continue;
       if (cbuf[2] == (0x01 << (expansionAddr - 6)))
-        break; // for us - address range 7 -13
+        break; // for address range 7 -13
     }
   }
-  if (idx == MAX_MODULES)
+
+  if (idx == moduleIdx)
   {
     sending = false;
     return; // no match return
   }
   expFaultBits = zoneExpanders[idx].expFaultBits;
 
-  int lcbuflen = 0;
+  uint8_t lcbuflen = 0;
   expSeq = (seq == 0x20 ? 0x34 : 0x31);
 
   // we use zone to either | or & bits depending if in fault or reset
@@ -515,7 +522,7 @@ void Vista::onExp(char cbuf[])
     }
     else
       currentFault = zoneExpanders[idx]; // no pending fault, use current fault data instead
-    lcbuflen = (char)4;
+    lcbuflen = 4;
     lcbuf[0] = (char)currentFault.expansionAddr;
     lcbuf[1] = (char)expSeq;
     // lcbuf[2] = (char) currentFault.relayState;
@@ -524,7 +531,7 @@ void Vista::onExp(char cbuf[])
   }
   else if (type == 0xF7)
   { // periodic  zone state poll (every 30 seconds) expander
-    lcbuflen = (char)4;
+    lcbuflen = 4;
     lcbuf[0] = (char)0xF0;
     lcbuf[1] = (char)expSeq;
     // lcbuf[2]= (char) expFaultBits ^ 0xFF; //closed zones - opposite of expfaultbits. If set in byte3 we clear here. (not used )
@@ -533,7 +540,7 @@ void Vista::onExp(char cbuf[])
   }
   else if (type == 0x00 || type == 0x0D)
   { // relay module
-    lcbuflen = (char)4;
+    lcbuflen = 4;
     lcbuf[0] = (char)expansionAddr;
     lcbuf[1] = (char)expSeq;
     lcbuf[2] = (char)0x00;
@@ -551,20 +558,26 @@ void Vista::onExp(char cbuf[])
   else
   {
     sending = false;
-    return; // we don't acknowledge if we don't know  //0x80 or 0x81
+    return; // we don't acknowledge   //0x80 or 0x81
   }
 
   uint32_t chksum = 0;
-  //delayMicroseconds(500);
-  vistaSerial->setBaud(4800);
-  for (int x = 0; x < lcbuflen; x++)
+  delayMicroseconds(500);
+   for (uint8_t x = 0; x < lcbuflen; x++)
   {
     chksum += lcbuf[x];
+  }
+  lcbuf[lcbuflen]=(char)((chksum-1) ^ 0xFF);
+  for (uint8_t x = 0; x < lcbuflen+1; x++)
+  {
+    if (filterOwnTx) 
+      extbuf[x]=lcbuf[x];
+      
     vistaSerial->write(lcbuf[x]);
   }
-  chksum -= 1;
-  chksum = chksum ^ 0xFF;
-  vistaSerial->write((char)chksum);
+  if (filterOwnTx) {
+    extidx=lcbuflen+1;
+  }
 
   sending = false;
 }
@@ -784,25 +797,31 @@ void Vista::writeChars()
       }
       tmpOutBuf[tmpIdx++] = c;
     }
-    if (kt.seq)
+
+    if (kt.seq > 0)
       tmpOutBuf[0] = kt.seq;
     else
       tmpOutBuf[0] = ((++writeSeq << 6) & 0xc0) | (lastkpaddr & 0x3F);
     tmpOutBuf[1] = sz + 1;
+
+    int checksum = 0;
+    uint8_t x;
+    for (x = 2; x < tmpOutBuf[1] + 1; x++)
+    {
+      checksum += (char)tmpOutBuf[x];
+    }
+    uint32_t chksum = 0x100 - (tmpOutBuf[0] + tmpOutBuf[1] + checksum);
+    tmpOutBuf[x]=(char)chksum;
+
   }
   //delayMicroseconds(500);
-  vistaSerial->setBaud(4800);
-  vistaSerial->write(tmpOutBuf[0]);
-  vistaSerial->write(tmpOutBuf[1]);
-  int checksum = 0;
-  for (int x = 2; x < tmpOutBuf[1] + 1; x++)
+  for (int x = 0; x < tmpOutBuf[1] + 2; x++)
   {
-    checksum += (char)tmpOutBuf[x];
     vistaSerial->write(tmpOutBuf[x]);
   }
-  uint32_t chksum = 0x100 - (tmpOutBuf[0] + tmpOutBuf[1] + checksum);
-  vistaSerial->write((char)chksum);
+
   expectByte = tmpOutBuf[0];
+  expectCmd = 0xf6;
   retries++;
   sending = false;
 }
@@ -885,7 +904,7 @@ void IRAM_ATTR Vista::rxHandleISR()
   if (rxState == sNormal || highTime == 0)
     vistaSerial->rxRead();
 
-#ifndef ESP32
+#ifdef ESP8266
   else // clear pending interrupts for this pin if any occur during transmission
     GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, 1 << rxPin);
 #endif
@@ -913,7 +932,7 @@ bool Vista::validChksum(char cbuf[], int start, int len)
 }
 
 #ifdef MONITORTX
-bool Vista::decodePacket()
+size_t Vista::decodePacket()
 {
   newExtCmd = false;
   // format 0xFA deviceid subcommand channel on/off
@@ -931,7 +950,7 @@ bool Vista::decodePacket()
       extcmd[6] = extbuf[6];
       extcmd[12] = 0x77; // flag to identify chksum error
       newExtCmd = true;
-      return 1; // for debugging return what was sent so we can see why the chcksum failed
+      return 13; // for debugging return what was sent so we can see why the chcksum failed
     }
 
     char cmdtype = (extcmd[2] & 1) ? extcmd[5] : extcmd[4];
@@ -971,7 +990,7 @@ bool Vista::decodePacket()
         if (!channel)
           channel = 8;
         channel = ((extcmd[1] - 7) * 8) + 8 + channel; // calculate zone
-        extcmd[4] = (extbuf[3] >> 3 & 3) ? 1 : 0;      // fault
+        extcmd[4] = ((extbuf[3] >> 3) & 3) ? 1 : 0;    // fault
       }
       else
       {
@@ -981,19 +1000,16 @@ bool Vista::decodePacket()
       extcmd[2] = cmdtype; // copy subcommand to byte 2
       extcmd[3] = channel;
       extcmd[5] = extbuf[2]; // relay data
-      extcmd[6] = 0;
       newExtCmd = true;
-      return 1;
+      return 6;
     }
     else if (cmdtype == 0xf7)
     {                      // expander poll request
       extcmd[2] = cmdtype; // copy subcommand to byte 2
       extcmd[3] = 0;
       extcmd[4] = extbuf[3]; // zone faults
-      extcmd[5] = 0;
-      extcmd[6] = 0;
       newExtCmd = true;
-      return 1;
+      return 5;
     }
     else if (cmdtype == 0x00 || cmdtype == 0x0D)
     {                      // relay channel update
@@ -1018,10 +1034,8 @@ bool Vista::decodePacket()
       }
       extcmd[3] = channel;
       extcmd[4] = extbuf[3] & 0x80 ? 1 : 0;
-      extcmd[5] = 0;
-      extcmd[6] = 0;
       newExtCmd = true;
-      return 1;
+      return 5;
     }
     else
     { // unknown subcommand for FA
@@ -1034,7 +1048,7 @@ bool Vista::decodePacket()
       extcmd[6] = extbuf[6];
       extcmd[12] = 0x72; // flag to identify unknown subcommand
       newExtCmd = true;
-      return 1; // for debugging return what was sent so we can see why the chcksum failed
+      return 13; // for debugging return what was sent so we can see why the chcksum failed
     }
   }
   else if (extcmd[0] == 0xFB)
@@ -1071,9 +1085,8 @@ bool Vista::decodePacket()
         // bit 7 - Loop 4 (0=Closed, 1=Open)
         // bit 8 - Loop 1 (0=Closed, 1=Open)
         extcmd[5] = extbuf[5];
-        extcmd[6] = 0;
         newExtCmd = true;
-        return 1;
+        return 6;
 
         // How to rebuild serial into single integer
         // uint32_t device_serial = (extbuf[2] & 0xF) << 16;  // Only the lower nibble is part of the device serial
@@ -1093,7 +1106,7 @@ bool Vista::decodePacket()
         extcmd[6] = extbuf[6];
         extcmd[12] = 0x77; // flag to identify cheksum failed
         newExtCmd = true;
-        return 1;
+        return 13;
       }
       //  #endif
     }
@@ -1110,7 +1123,7 @@ bool Vista::decodePacket()
       extcmd[6] = extbuf[6];
       extcmd[12] = 0x74; // flag to identify unknown command
       newExtCmd = true;
-      return 1;
+      return 13;
     }
   }
   else if (extcmd[0] != 0 && extcmd[0] != 0xf6)
@@ -1124,7 +1137,7 @@ bool Vista::decodePacket()
     //  Serial.printf("extcmd %02x\r\n",extcmd[2+i]);
   }
   newExtCmd = true;
-  return 1;
+  return extidx + 2;
 }
 #endif
 #ifdef MONITORTX
@@ -1135,7 +1148,6 @@ uint8_t Vista::getExtBytes()
 
   if (!vistaSerialMonitor)
     return 0;
-
   while (vistaSerialMonitor->available())
   {
     x = vistaSerialMonitor->read();
@@ -1152,10 +1164,10 @@ uint8_t Vista::getExtBytes()
   if (extidx > 0 && markPulse)
   {
     // ok, we are on the next pulse (gap) , lets decode the previous msg data
-    if (decodePacket())
-      ret = extidx + 2;
-    extidx = 0;
+    ret = decodePacket();
+    pushCmdQueueItem(ret, extidx);
     memset(extbuf, 0, OUTBUFSIZE); // clear buffer mem
+    extidx = 0;
   }
 
   return ret;
@@ -1171,13 +1183,8 @@ bool Vista::handle()
 #ifdef MONITORTX
   if (vistaSerialMonitor != NULL)
   {
-    x = getExtBytes();
-
-    if (x)
-    {
-      pushCmdQueueItem();
+    if (getExtBytes())
       return true;
-    }
   }
 #endif
 
@@ -1195,27 +1202,33 @@ bool Vista::handle()
     x = vistaSerial->read();
 
     memset(cbuf, 0, CMDBUFSIZE); // clear buffer mem
-
     if (expectByte && x)
     {
-
       if (x == expectByte)
       {
         retries = 0;
+        _retriesf9 = 0;
         expectByte = 0;
         retryAddr = 0;
         cbuf[0] = 0x78; // for flagging an expect byte found ok
         cbuf[1] = x;
-        pushCmdQueueItem();
+        pushCmdQueueItem(2);
         return 1; // 1 for logging. 0 for normal
       }
-      else
+      else if (expectCmd == 0xf9)
       {
-        expectByte = 0;
-        // we did not get the expect byte response. So assume this byte is another cmd
+        //request an F9 resend since we did not get the ack from the panel
+        if (peekNextKpAddr() != LRRADDR) {
+            keyType kt;
+            kt.kpaddr = LRRADDR;
+            kt.count = 0;
+            outbuf[inbufIdx] = kt;
+            inbufIdx = (inbufIdx + 1) % CMDBUFSIZE;
+        }
       }
+      // we did not get the expect byte response. So assume this byte is another cmd
+      expectByte = 0;
     }
-
     // expander request command
     if (x == 0xFA)
     {
@@ -1235,16 +1248,28 @@ bool Vista::handle()
         readChars(1, cbuf, &gidx); // cmd
       }
       readChars(1, cbuf, &gidx); // chksum
+      #ifdef MONITORTX
+      memset(extcmd, 0, OUTBUFSIZE); // store the previous panel sent data in extcmd buffer for later use
+      memcpy(extcmd, cbuf, 7);
+      #endif
       if (!validChksum(cbuf, 0, gidx))
         cbuf[12] = 0x77;
       else
+      {
         onExp(cbuf);
-      newCmd = true;
-#ifdef MONITORTX
-      memset(extcmd, 0, OUTBUFSIZE); // store the previous panel sent data in extcmd buffer for later use
-      memcpy(extcmd, cbuf, 7);
-#endif
-      pushCmdQueueItem();
+        newCmd = true;
+        pushCmdQueueItem(gidx);
+        if (filterOwnTx && extidx) {
+          newCmd=false;
+          newExtCmd=true;
+          uint8_t ret = decodePacket();
+          pushCmdQueueItem(ret, extidx);
+          extidx=0;
+        }
+
+      }
+
+
       return 1;
     }
 
@@ -1263,7 +1288,7 @@ bool Vista::handle()
         onDisplay(cbuf, &gidx);
         newCmd = true; // new valid cmd, process it
       }
-      pushCmdQueueItem();
+      pushCmdQueueItem(gidx);
       return 1; // return 1 to log packet
     }
 
@@ -1277,17 +1302,27 @@ bool Vista::handle()
       readChars(1, cbuf, &gidx);
       // read len
       readChars(1, cbuf, &gidx);
-      readChars(cbuf[2], cbuf, &gidx);
-      if (!validChksum(cbuf, 0, gidx))
-        cbuf[12] = 0x77;
-      else
+      if (cbuf[2] == 0)
+      {
         onLrr(cbuf, &gidx);
-      newCmd = true;
+        newCmd = true;
+      }
+      else
+      {
+        readChars(cbuf[2], cbuf, &gidx);
+        if (!validChksum(cbuf, 0, gidx))
+          cbuf[12] = 0x77;
+        else
+        {
+          onLrr(cbuf, &gidx);
+          newCmd = true;
+        }
+      }
 #ifdef MONITORTX
       memset(extcmd, 0, OUTBUFSIZE); // store the previous panel sent data in extcmd buffer for later use
       memcpy(extcmd, cbuf, 6);
 #endif
-      pushCmdQueueItem();
+      pushCmdQueueItem(gidx);
       return 1;
     }
     // key ack
@@ -1308,7 +1343,7 @@ bool Vista::handle()
       memcpy(extcmd, cbuf, 7);
 
 #endif
-      pushCmdQueueItem();
+      pushCmdQueueItem(gidx);
       return 1;
     }
 
@@ -1318,29 +1353,34 @@ bool Vista::handle()
       vistaSerial->setBaud(4800);
       gidx = 0;
       cbuf[gidx++] = x;
-      readChars(1, cbuf, &gidx);
+      readChars(1, cbuf, &gidx); // len
       readChars(cbuf[1], cbuf, &gidx);
       if (!validChksum(cbuf, 0, gidx))
         cbuf[12] = 0x77;
       else
+      {
         onAUI(cbuf, &gidx);
-      newCmd = true;
-      pushCmdQueueItem();
+        newCmd = true;
+      }
+      pushCmdQueueItem(gidx);
       return 1;
     }
-    /*
-        //unknown
-        if (x == 0xF8) {
-          vistaSerial -> setBaud(4800);
-          newCmd = true;
-          gidx = 0;
-          cbuf[gidx++] = x;
-          readChars(F8_MESSAGE_LENGTH - 1, cbuf, & gidx);
-          if (!validChksum(cbuf, 0, gidx))
-            cbuf[12] = 0x77;
-          return 1;
-        }
-        */
+    // // unknown
+    if (x == 0xF8)
+    {
+      vistaSerial->setBaud(4800);
+      gidx = 0;
+      cbuf[gidx++] = x;                // cmd byte
+      readChars(1, cbuf, &gidx);       // header byte
+      readChars(1, cbuf, &gidx);       // len byte
+      readChars(cbuf[2], cbuf, &gidx); // read len bytes
+      if (!validChksum(cbuf, 0, gidx))
+        cbuf[12] = 0x77;
+      else
+        newCmd = true;
+      pushCmdQueueItem(gidx);
+      return 1;
+    }
     // unknown
     if (x == 0xF0)
     {
@@ -1353,7 +1393,7 @@ bool Vista::handle()
       memset(extcmd, 0, OUTBUFSIZE); // store the previous panel sent data in extcmd buffer for later use
       memcpy(extcmd, cbuf, 2);
 #endif
-      pushCmdQueueItem();
+      pushCmdQueueItem(gidx);
       return 1;
     }
 
@@ -1361,17 +1401,18 @@ bool Vista::handle()
     if (x == 0xFB)
     {
       vistaSerial->setBaud(4800);
-      newCmd = true;
       gidx = 0;
       cbuf[gidx++] = x;
       readChars(4, cbuf, &gidx);
       if (!validChksum(cbuf, 0, gidx))
         cbuf[12] = 0x77;
+      else
+        newCmd = true;
 #ifdef MONITORTX
       memset(extcmd, 0, OUTBUFSIZE); // store the previous panel sent data in extcmd buffer for later use
       memcpy(extcmd, cbuf, 6);
 #endif
-      pushCmdQueueItem();
+      pushCmdQueueItem(gidx);
       return 1;
     }
 
@@ -1399,7 +1440,7 @@ bool Vista::handle()
       yield();
 #endif
     }
-    pushCmdQueueItem();
+    pushCmdQueueItem(gidx);
     return 1;
   }
 

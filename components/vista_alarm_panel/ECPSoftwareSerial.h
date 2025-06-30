@@ -24,6 +24,7 @@ Modified for 4800 8E2
 
 #pragma once
 
+
 #include <inttypes.h>
 
 #include <Stream.h>
@@ -33,10 +34,17 @@ Modified for 4800 8E2
 #include <atomic>
 
 #include "Arduino.h"
-#include "driver/timer.h"
+//#include "driver/timer.h"
 
 #if defined(ESP32) && not defined(IRAM_ATTR)
 #define IRAM_ATTR IRAM_ATTR
+#endif
+#if defined(USE_RP2040) && not defined(IRAM_ATTR)
+#define IRAM_ATTR
+#endif
+
+#if defined(USE_RP2040) && not defined(ESP)
+#define ESP rp2040
 #endif
 
 // If only one tx or rx wanted then use this as parameter for the unused pin
@@ -165,11 +173,11 @@ private:
     {
 #if defined(ESP32)
 
-     //   return esp_timer_get_time()  << 1;
+       return esp_timer_get_time()  << 1;
     //    uint64_t t;
     //    t=timer_group_get_counter_value_in_isr(TIMER_GROUP_0, TIMER_0);
     //    return t << 1;
-          return micros() << 1;
+     //     return micros() << 1;
 
 #else
         return micros() << 1;
@@ -177,3 +185,4 @@ private:
 #endif
     }
 };
+

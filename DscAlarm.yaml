@@ -79,9 +79,9 @@ external_components:
     refresh: 10min
     
     
-#web keypad component. Remove or comment if not needed
-# each included files will be downloaded automatically and compiled within the flash.  
-# there will be no need for internet access when running.
+#web keypad component. remove or comment if not needed
+# Each included file will be downloaded automatically and compiled within the flash.  
+# There will be no need for internet access when running.
 #For www.js build details and source: https://github.com/Dilbert66/esphome-webserver-custom/tree/keypad
 #Component source: https://github.com/Dilbert66/esphome-components/tree/keypad/components/web_keypad
 ### Note: this is an ESP32 only component. The esp8266 does not support the resources needed.
@@ -90,16 +90,30 @@ web_keypad:
   port: 80 
   partitions: 1  # a keypad will be shown for each partition
   log: false
+  version: 3
+  sorting_groups:
+    - id: zones
+      name: "Zones"
+      sorting_weight: -4
+    - id: partition1
+      name: "Partition 1"
+      sorting_weight: -3
+    - id: partition2
+      name: "Partition 2"
+      sorting_weight: -2
+    - id: partition3
+      name: "Partition 3"
+      sorting_weight: -1
   auth:          #this section is optional. Enable if you need authentication/encryption
     username: test
     password: test
     encryption: true  #set true to use AES256HMAC encryption/auth for sent keys and returned LCD messages
                       #set to false to use Digest authentication - no encryption
   config_url: https://dilbert66.github.io/config_files/config_dsc.yml  
-  js_url: https://dilbert66.github.io/js_files/www.js
+  js_url: https://dilbert66.github.io/js_files/www_v3.js
   ## If you prefer to use locally hosted compile time files comment the two lines above and uncomment below
   #config_local: ./config_dsc.yml    
-  #js_local: ./www.js    
+  #js_local: ./www_v3.js    
   
   ## custom function call to send keypresses if other than dsc/vista components are used. Parmeters are a string keys and int partition
   #service_lambda: |- 
@@ -185,11 +199,19 @@ binary_sensor:
     id: z1
     name: "Front door z1"
     device_class: door
-
+    #example/optional sorting group functionality for web_keypad component
+#    web_keypad:
+#      sorting_group_id: zones
+#      sorting_weight: 1
+#
   - platform: dsc_alarm_panel
     id: z2
     name: "Garage door z2"
     device_class: door
+    #example/optional sorting group
+#    web_keypad:
+#      sorting_group_id: zones
+#      sorting_weight: 2
       
 
   - platform: dsc_alarm_panel
