@@ -3,14 +3,21 @@
 #include "esphome/components/network/util.h"
 #include "esphome/core/application.h"
 #include "esphome/core/entity_base.h"
+#include "esphome/core/controller_registry.h"
 #include "esphome/core/log.h"
 #include "esphome/core/util.h"
-#include "ArduinoJson.h"
+#include "esphome/core/entity_base.h"
+#include "esphome/core/helpers.h"
+
+#ifdef USE_WIFI
+#include "esphome/components/wifi/wifi_component.h"
+#endif
+
 
 #if defined(USE_DSC_PANEL)
 #include "esphome/components/dsc_alarm_panel/dscAlarm.h"
-
 #endif
+
 #if defined(USE_VISTA_PANEL)
 #include "esphome/components/vista_alarm_panel/vistaalarm.h"
 #endif
@@ -21,19 +28,36 @@
 #include "esphome/components/light/light_json_schema.h"
 #endif
 
-#ifdef USE_LOGGER
-#include "esphome/components/logger/logger.h"
-#endif
-
 #ifdef USE_CLIMATE
 #include "esphome/components/climate/climate.h"
 #endif
 
+#ifdef USE_WEBKEYPAD_OTA
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+#include "esphome/components/ota/ota_backend_factory.h"
+#else
+#include "esphome/components/ota/ota_backend.h"
+#endif
+#endif
+
 #ifdef USE_ARDUINO
-#include <StreamString.h>
-#if not defined(ESP8266)
+#if defined(USE_ESP8266) || defined(USE_RP2040)
+#include <Updater.h>
+#elif defined(USE_ESP32) || defined(USE_LIBRETINY)
 #include <Update.h>
 #endif
+#endif  // USE_ARDUINO
+
+#ifdef USE_RP2040
+char * strchrnul(const char * s, int c)
+{
+   while(*s)
+   {
+      if (c == *s) break;
+      s++;
+   }
+   return const_cast<char *>(s);
+}
 #endif
 
 namespace esphome
@@ -41,37 +65,38 @@ namespace esphome
     namespace web_keypad
     {
 
-#define KEYSIZE 32
-
-        static const char *const TAG = "web_server";
-        void *webServerPtr;
-
-#ifdef USE_WEBKEYPAD_PRIVATE_NETWORK_ACCESS
-        static const char *const HEADER_PNA_NAME = "Private-Network-Access-Name";
-        static const char *const HEADER_PNA_ID = "Private-Network-Access-ID";
-        static const char *const HEADER_CORS_REQ_PNA = "Access-Control-Request-Private-Network";
-        static const char *const HEADER_CORS_ALLOW_PNA = "Access-Control-Allow-Private-Network";
+#if defined(ESP8266)
+#define FC(s) (String(PSTR(s)).c_str())
+#define FCS(s) (String(PSTR(s)).c_str()) 
+#else
+#define FC(s) ((const char*)(s))
+#define FCS(s) ((const char*)(s))
 #endif
+ 
+void ev_handler_cb(struct mg_connection *c, int ev, void *ev_data) {
+    WebServer *srv = reinterpret_cast<WebServer *>(c->fn_data);
+    if (srv != NULL)
+            srv->ev_handler(c,ev,ev_data);
 
-        void WebServer::parseUrlParams(char *queryString, int resultsMaxCt, boolean decodeUrl, JsonObject doc)
+}
+
+
+        static const char *const TAG = "web_keypad";
+   
+        void WebServer::parseUrlParams(char *queryString, int resultsMaxCt, bool decodeUrl, JsonObject doc)
         {
             int ct = 0;
             char *name;
             char *value;
             if (decodeUrl)
                 percentDecode(queryString);
-            // MG_INFO(("query=%s",queryString));
             while (queryString && *queryString && ct < resultsMaxCt)
             {
                 name = strsep(&queryString, "&");
                 value = strchrnul(name, '=');
-
                 if (*value)
                     *value++ = '\0';
-                std::string n = std::string(name);
-                std::string v = std::string(value);
-                doc[n] = v;
-                // MG_INFO(("parameter %s = %s",n.c_str(),v.c_str()));
+                doc[name] = value;
                 ct++;
             }
         }
@@ -155,46 +180,47 @@ namespace esphome
             size_t domain_end = url.find('/', 1);
             if (domain_end == std::string::npos)
                 return;
-            doc["domain"] = url.substr(1, domain_end - 1);
+           doc[FC("domain")] = url.substr(1, domain_end - 1);
             if (url.length() == domain_end - 1)
                 return;
             size_t id_begin = domain_end + 1;
             size_t id_end = url.find('/', id_begin);
             if (id_end == std::string::npos)
             {
-                doc["oid"] = url.substr(id_begin, url.length() - id_begin);
+                doc[FC("oid")] = url.substr(id_begin, url.length() - id_begin);
             }
-            doc["oid"] = url.substr(id_begin, id_end - id_begin);
+            doc[FC("oid")] = url.substr(id_begin, id_end - id_begin);
             size_t method_begin = id_end + 1;
-            doc["action"] = url.substr(method_begin, url.length() - method_begin);
-            std::string a = doc["domain"];
-            // MG_INFO(("in parseurl domain=%s",a.c_str()));
+            doc[FC("action")] = url.substr(method_begin, url.length() - method_begin);
         }
-
+       
         void WebServer::ws_reply(mg_connection *c, const char *data, bool ok)
         {
-            if (c->data[0] != 'W')
+            std::string newdata=std::string(data);
+            if (!c->is_websocket)
             {
                 if (ok)
                 {
                     if (strlen(data) == 0)
                     {
-                        mg_http_reply(c, 204, PSTR("Access-Control-Allow-Origin: *\r\n"), "");
+                        mg_http_reply(c, 204, FC("Access-Control-Allow-Origin: *\r\n"), "");
                     }
                     else
                     {
+                #ifdef USE_WEBKEYPAD_ENCRYPTION
                         if (credentials_.crypt)
                         {
-                            if (c->data[1])
+                            if (c->is_authenticated)
                             {
                                 mg_http_reply(c, 404, "", "");
                                 return;
                             }
                             else
-                                data = encrypt(data).c_str();
+                                encrypt(newdata);
                         }
+                #endif
                         //  ESP_LOGD(TAG,"sending %s",data);
-                        mg_http_reply(c, 200, PSTR("Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n"), "%s", data);
+                        mg_http_reply(c, 200, FC("Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n"), "%s", newdata.c_str());
                     }
                 }
                 else
@@ -202,44 +228,57 @@ namespace esphome
             }
         }
 
-        WebServer::WebServer()
+std::string WebServer::get_object_id(EntityBase * entity) {
+     const StringRef &name = entity->get_name();
+ #if defined(USE_DSC_PANEL) || defined(USE_VISTA_PANEL)
+  //ESP_LOGD("test","checking  name: %s,hash: %d",entity->get_name().c_str(),entity->get_object_id_hash());
+  const char *  oid = alarm_panel::alarmPanelPtr->getIdType(entity->get_object_id_hash());
+  if (strcmp(oid,"") != 0)  return std::string(oid);
+ #endif
+ 
+  #if ESPHOME_VERSION_CODE < VERSION_CODE(2026, 1, 0)
+  return  entity->get_object_id();
+  #else
+  char object_id_buf[128];
+  return std::string(entity->get_object_id_to(object_id_buf));
+  #endif
+ }
+
+
+       WebServer::WebServer()
             : entities_iterator_(ListEntitiesIterator(this))
         {
 #ifdef USE_ESP32
             to_schedule_lock_ = xSemaphoreCreateMutex();
 #endif
-            webServerPtr = this;
-          //  this->pref_ = global_preferences->make_preference<KeypadConfig>(fnv1_hash(App.get_compilation_time()));
-
+           // credentials_ = new Credentials;
         }
 
-#ifdef USE_WEBKEYPAD_CSS_INCLUDE
-        void WebServer::set_css_include(const char *css_include) { this->css_include_ = css_include; }
-#endif
-#ifdef USE_WEBKEYPAD_JS_INCLUDE
-        void WebServer::set_js_include(const char *js_include) { this->js_include_ = js_include; }
-#endif
 
-        void WebServer::set_keypad_config(const char *json_keypad_config,uint8_t version)
+        WebServer::~WebServer() {
+           // delete credentials_;
+        }
+
+// #ifdef USE_WEBKEYPAD_CSS_INCLUDE
+//         void WebServer::set_css_include(const char *css_include) { this->css_include_ = css_include; }
+// #endif
+// #ifdef USE_WEBKEYPAD_JS_INCLUDE
+//         void WebServer::set_js_include(const char *js_include) { this->js_include_ = js_include; }
+// #endif
+
+        void WebServer::get_keypad_config(std::string &out)
         {
-            // if (!this->pref_.load(&keypadconfig_) || keypadconfig_.version < version){
-            //     ESP_LOGD(TAG,"version=%d,config=%s",keypadconfig_.config,keypadconfig_.version);
-      //              keypadconfig_.version = version;
-     //               memcpy(keypadconfig_.config,json_keypad_config,strlen(json_keypad_config));
-  //                  this->pref_.save(&keypadconfig_);
+            #ifdef ESP8266
+           char buf[ESPHOME_WEBKEYPAD_CONFIG_INCLUDE_SIZE];
+           memcpy_P(buf,ESPHOME_WEBKEYPAD_CONFIG_INCLUDE,ESPHOME_WEBKEYPAD_CONFIG_INCLUDE_SIZE);
+           #else
+            const char *buf = (const char *)ESPHOME_WEBKEYPAD_CONFIG_INCLUDE;
+           #endif
 
-           // } 
-             //if new version is higher or same than flash version, overwrite. Save version and config
-             json_keypad_config_=json_keypad_config;
+           out = std::string(buf,ESPHOME_WEBKEYPAD_CONFIG_INCLUDE_SIZE);
         }
 
-        const char * WebServer::get_keypad_config()
-        {
-           // return (char*) &keypadconfig_.config ;
-           return json_keypad_config_.c_str();
-        }
-
-        const std::string WebServer::get_config_json(unsigned long cid)
+        void WebServer::get_config_json(unsigned long cid,std::string & out)
         {
 
             uint8_t key[16];
@@ -249,24 +288,23 @@ namespace esphome
             cd.token = token;
             cd.lastseq = 0;
             tokens_[cid] = cd;
-            return json::build_json([this, cid, token](JsonObject root)
-                                    {
-                                        root["title"] = App.get_friendly_name().empty() ? App.get_name() : App.get_friendly_name();
-                                        root["comment"] = App.get_comment();
-                                        root["ota"] = this->allow_ota_;
-                                        root["log"] = this->expose_log_;
-                                        root["lang"] = "en";
-                                        root["partitions"] = this->partitions_;
-                                        root["keypad"] = this->show_keypad_;
-                                        root["crypt"] = this->crypt_;
-                                        root["cid"] = cid;
-                                        root["token"] = token; });
+            json::JsonBuilder builder;
+            JsonObject root = builder.root(); 
+            root[FC("title")] = App.get_friendly_name().empty() ? App.get_name() : App.get_friendly_name();
+            root[FC("comment")] = App.get_comment();
+            root[FC("ota")] = this->allow_ota_;
+            root[FC("log")] = this->expose_log_;
+            root[FC("lang")] = "en";
+            root[FC("partitions")] = this->partitions_;
+            root[FC("keypad")] = this->show_keypad_;
+            root[FC("crypt")] = this->crypt_;
+            root[FC("cid")] = cid;
+            root[FC("token")] = token;
+            out=builder.serialize();
         }
 
-        const std::string WebServer::escape_json(const char *input)
+        void WebServer::escape_json(const char *input,std::string & output)
         {
-            std::string output;
-
             for (int i = 0; i < strlen(input); i++)
             {
 
@@ -305,155 +343,239 @@ namespace esphome
                 }
             }
 
-            return output;
         }
 
-        void WebServer::setup()
-        {
-            // ESP_LOGCONFIG(TAG, PSTR("Setting up web server..."));
-            this->setup_controller(this->include_internal_);
-            mg_mgr_init(&mgr);
-#ifdef USE_LOGGER
-            if (logger::global_logger != nullptr && this->expose_log_)
+        
+
+void WebServer::setup()
+{
+
+    ControllerRegistry::register_controller(this);
+    mg_log_set(MG_LL_ERROR); //MG_LL_NONE, MG_LL_ERROR, MG_LL_INFO, MG_LL_DEBUG, MG_LL_VERBOSE
+    mg_mgr_init(&mgr);
+    #ifdef USE_LOGGER
+#if ESPHOME_VERSION_CODE < VERSION_CODE(2025, 12, 0)
+
+    if (logger::global_logger != nullptr && this->expose_log_)
+    {
+        logger::global_logger->add_on_log_callback(
+            [this](int level, const char *tag, const char *message, size_t message_len)
             {
-                logger::global_logger->add_on_log_callback(
-                    [this](int level, const char *tag, const char *message)
-                    {
-                        std::string msg = escape_json(message);
-                        this->push(LOG, msg.c_str());
-                    });
-            }
+                (void) message_len;
+                std::string msg;
+                escape_json(message,msg);
+                this->push(LOG, msg.c_str());
+            });
+    }
+
+    
+#else
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+  if (logger::global_logger != nullptr && this->expose_log_) {
+    logger::global_logger->add_log_callback(
+        this, [](void *self, uint8_t level, const char *tag, const char *message, size_t message_len) {
+          static_cast<WebServer *>(self)->on_log(level, tag, message, message_len);
+        });
+  }
+
+#else
+  if (logger::global_logger != nullptr && this->expose_log_) {
+    logger::global_logger->add_log_listener(this);
+  }
+
 #endif
+#endif
+#endif
+  this->set_interval(10000, [this](){ this->push(PING, "", millis(), 30000); });
+
+  ESP_LOGD(TAG,"Web keypad setup completed");
+}
 
 
-            this->set_interval(10000, [this]()
-                               { this->push(PING, "", millis(), 30000); });
-        }
-        void WebServer::loop()
-        {
+
+void WebServer::loop()
+{
 #ifdef USE_ESP32
-            if (xSemaphoreTake(this->to_schedule_lock_, 0L))
-            {
-                std::function<void()> fn;
-                if (!to_schedule_.empty())
-                {
-                    // scheduler execute things out of order which may lead to incorrect state
-                    // this->defer(std::move(to_schedule_.front()));
-                    // let's execute it directly from the loop
-                    fn = std::move(to_schedule_.front());
-                    to_schedule_.pop_front();
-                }
-                xSemaphoreGive(this->to_schedule_lock_);
-                if (fn)
-                {
-                    fn();
-                }
-            }
+    if (xSemaphoreTake(this->to_schedule_lock_, 0L))
+    {
+        std::function<void()> fn;
+        if (!to_schedule_.empty())
+        {
+            // scheduler execute things out of order which may lead to incorrect state
+            // let's execute it directly from the loop
+            fn = std::move(to_schedule_.front());
+            to_schedule_.pop_front();
+        }
+        xSemaphoreGive(this->to_schedule_lock_);
+        if (fn)
+        {
+            fn();
+        }
+    }
 #endif
-            this->entities_iterator_.advance();
 
-            if (firstrun_ && network::is_connected())
-            {
-                char addr[50];
-                sprintf(addr, "http://0.0.0.0:%d", port_);
-                ESP_LOGD(TAG, "Starting web server on %s:%d", network::get_use_address().c_str(), port_);
-                if ((c = mg_http_listen(&mgr, addr, ev_handler, this)) == NULL)
-                {
-                    printf("Cannot listen on address..");
-                    return;
-                }
-                firstrun_ = false;
-            }
-            mg_mgr_poll(&mgr, 0);
-        }
-        void WebServer::dump_config()
-        {
-            ESP_LOGCONFIG(TAG, "Web Server:");
-            ESP_LOGCONFIG(TAG, "  Address: %s:%u", network::get_use_address().c_str(), port_);
-        }
-        float WebServer::get_setup_priority() const { return setup_priority::WIFI - 1.0f; }
+    if (!this->entities_iterator_.completed())
+        this->entities_iterator_.advance();
 
-        void WebServer::handle_index_request(struct mg_connection *c)
-        {
+   #if defined(USE_WIFI) && !defined(USE_CAPTIVE_PORTAL)
+   is_ap_active_ = wifi::global_wifi_component->is_ap_active();
+   #endif
 
-            const char *buf = (const char *)ESPHOME_WEBKEYPAD_INDEX_HTML;
-            mg_printf(c, PSTR("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_INDEX_HTML_SIZE);
-            mg_send(c, buf, ESPHOME_WEBKEYPAD_INDEX_HTML_SIZE);
-            c->is_resp = 0;
-        }
+    if (firstrun_ && ( network::is_connected() || is_ap_active_ ))
+    {
+        char addr[30];
+        snprintf(addr,30, "http://0.0.0.0:%d", port_);
+        ESP_LOGD(TAG, "Starting web server on %s:%d", network::get_use_address(), port_);
+        struct mg_connection *c = mg_http_listen(&mgr, addr,&ev_handler_cb,this);
+        firstrun_ = false;
+        
+    }
+    
+    mg_mgr_poll(&mgr, 0);
+
+}
+
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 12, 0)
+ #ifdef USE_LOGGER
+void WebServer::on_log(uint8_t level, const char *tag, const char *message, size_t message_len) {
+  (void) level;
+  (void) tag;
+  (void) message_len;
+                std::string msg;
+                escape_json(message,msg);
+                this->push(LOG, msg.c_str());
+   }
+#endif
+#endif
+void WebServer::dump_config()
+{
+    ESP_LOGCONFIG(TAG, "Web Server:");
+    ESP_LOGCONFIG(TAG, "  Address: %s:%u", network::get_use_address(), port_);
+}
+float WebServer::get_setup_priority() const { return setup_priority::WIFI - 1.0f; }
+
+
+void WebServer::handle_index_request(struct mg_connection *c)
+{
+    const char *buf = (const char *)ESPHOME_WEBKEYPAD_INDEX_HTML;
+    mg_printf(c, FC("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_INDEX_HTML_SIZE);
+    mg_send(c, buf, ESPHOME_WEBKEYPAD_INDEX_HTML_SIZE);
+    c->is_resp = 0;
+
+}
 
 #ifdef USE_WEBKEYPAD_PRIVATE_NETWORK_ACCESS
-        void WebServer::handle_pna_cors_request(struct mg_connection *c)
-        {
+void WebServer::handle_pna_cors_request(struct mg_connection *c)
+{
 
-            std::string mac = get_mac_address_pretty();
-            mg_printf(c, PSTR("HTTP/1.1 200 OK\r\n%s:%s\r\n%s:%s\r\n%s:%s\r\n\r\n"), HEADER_CORS_ALLOW_PNA, "true", HEADER_PNA_NAME, App.get_name().c_str(), HEADER_PNA_ID, mac.c_str());
-            c->is_resp = 0;
-            // MG_INFO((" in cors header %s",HEADER_CORS_ALLOW_PNA));
-        }
+#ifdef USE_WEBKEYPAD_PRIVATE_NETWORK_ACCESS
+        const char* const HEADER_PNA_NAME  = FCS("Private-Network-Access-Name");
+        const char* const HEADER_PNA_ID = FCS("Private-Network-Access-ID");
+        const char* const HEADER_CORS_ALLOW_PNA =  FCS("Access-Control-Allow-Private-Network");
+#endif
+    std::string mac = get_mac_address_pretty();
+    mg_printf(c, FC("HTTP/1.1 200 OK\r\n%s:%s\r\n%s:%s\r\n%s:%s\r\n\r\n"), HEADER_CORS_ALLOW_PNA, "true", HEADER_PNA_NAME, App.get_name().c_str(), HEADER_PNA_ID, mac.c_str());
+    c->is_resp = 0;
+}
 #endif
 
 #ifdef USE_WEBKEYPAD_CSS_INCLUDE
-        void WebServer::handle_css_request(struct mg_connection *c)
-        {
-
-            const char *buf = (const char *)ESPHOME_WEBKEYPAD_CSS_INCLUDE;
-            mg_printf(c, PSTR("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Encoding: gzip\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_CSS_INCLUDE_SIZE);
-            mg_send(c, buf, ESPHOME_WEBKEYPAD_CSS_INCLUDE_SIZE);
-            c->is_resp = 0;
-        }
+void WebServer::handle_css_request(struct mg_connection *c)
+{
+    const char *buf = (const char *)ESPHOME_WEBKEYPAD_CSS_INCLUDE;
+    mg_printf(c, FC("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Encoding: gzip\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_CSS_INCLUDE_SIZE);
+    mg_send(c, buf, ESPHOME_WEBKEYPAD_CSS_INCLUDE_SIZE);
+    c->is_resp = 0;
 #endif
+
 
 #ifdef USE_WEBKEYPAD_JS_INCLUDE
-        void WebServer::handle_js_request(struct mg_connection *c)
-        {
 
-            const char *buf = (const char *)ESPHOME_WEBKEYPAD_JS_INCLUDE;
-            mg_printf(c, PSTR("HTTP/1.1 200 OK\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Encoding: gzip\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE);
-            for (int s = 0; s < ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE; s = s + 1024)
-            { // we send the file in blocks of 1024 then run poll to purge the buffer out in order to keep io buffer size small
-                mg_send(c, &buf[s], 1024);
-                mg_mgr_poll(&mgr, 0);
-            }
-            c->is_resp = 0;
-        }
+//large file so we send in 1k blocks on every loop iteration
+void WebServer::send_js_include(mg_connection *c){
+    const size_t BS=1024;       
+    uint32_t  index = *(uint32_t *) c->data;  //use connection data array to store curent index
+    const char *buf = (const char *)ESPHOME_WEBKEYPAD_JS_INCLUDE;
+    size_t blocksize = index + BS <= ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE ? BS : ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE - index;
+    if (c->send.len < blocksize  && mg_send(c, &buf[index],blocksize)) {
+        index=index+blocksize;
+        *(uint32_t *) c->data=(uint32_t) index;
+    }
+
+    if (index >= ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE) {
+        c->is_resp = 0;
+        c->is_sending = 0; 
+        *(uint32_t *) c->data = (uint32_t)0;
+    }
+                
+}
+
+
+void WebServer::handle_js_request(struct mg_connection *c)
+{
+        mg_printf(c,FC("HTTP/1.1 200 OK\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Encoding: gzip\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n"), ESPHOME_WEBKEYPAD_JS_INCLUDE_SIZE);
+        c->is_sending  =1; 
+        *(uint32_t *) c->data = (uint32_t)0;
+        send_js_include(c);
+}
 #endif
 
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)  
+
+
+    char icon_buf[MAX_ICON_LENGTH];
+
 #define set_json_id(root, obj, sensor, start_config)                            \
-    (root)["id"] = sensor;                                                      \
+    (root)["id"] = std::string(sensor) + "-" + get_object_id(obj);              \
     if (((start_config) == DETAIL_ALL))                                         \
     {                                                                           \
-        (root)["name"] = (obj)->get_name();                                     \
-        (root)["icon"] = (obj)->get_icon();                                     \
-        (root)["entity_category"] = (obj)->get_entity_category();               \
+        (root)[FC("name")] = (obj)->get_name();                                     \
+        (root)[FC("icon")] = obj->get_icon_to(icon_buf);                           \
+        (root)[FC("entity_category")] = (obj)->get_entity_category();               \
+        (root)[FC("domain")] = sensor;                                              \
         if ((obj)->is_disabled_by_default())                                    \
-            (root)["is_disabled_by_default"] = (obj)->is_disabled_by_default(); \
+            (root)[FC("is_disabled_by_default")] = (obj)->is_disabled_by_default(); \
     }
+#else
+#define set_json_id(root, obj, sensor, start_config)                            \
+    (root)["id"] = std::string(sensor) + "-" + get_object_id(obj);              \
+    if (((start_config) == DETAIL_ALL))                                         \
+    {                                                                           \
+        (root)[FC("name")] = (obj)->get_name();                                     \
+        (root)[FC("icon")] = (obj)->get_icon_ref();                                 \
+        (root)[FC("entity_category")] = (obj)->get_entity_category();               \
+        (root)[FC("domain")] = sensor;                                              \
+        if ((obj)->is_disabled_by_default())                                    \
+            (root)[FC("is_disabled_by_default")] = (obj)->is_disabled_by_default(); \
+    }
+#endif
 
 #define set_json_value(root, obj, sensor, value, start_config) \
     set_json_id((root), (obj), sensor, start_config);          \
-    (root)["value"] = value;
+    (root)[FC("value")] = value;
 
 #define set_json_icon_state_value(root, obj, sensor, state, value, start_config) \
     set_json_value(root, obj, sensor, value, start_config);                      \
-    (root)["state"] = state;
+    (root)[FC("state")] = state;
 
 #ifdef USE_SENSOR
-        void WebServer::on_sensor_update(sensor::Sensor *obj, float state)
+        void WebServer::on_sensor_update(sensor::Sensor *obj)
         {
-            this->push(STATE, this->sensor_json(obj, state, DETAIL_STATE).c_str());
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
+            this->push(STATE, this->sensor_json(obj, obj->state, DETAIL_STATE).c_str());
         }
 
         void WebServer::handle_sensor_request(mg_connection *c, JsonObject doc)
         {
             for (sensor::Sensor *obj : App.get_sensors())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
                 auto detail = DETAIL_STATE;
-                if (doc.containsKey("detail"))
+                if (doc[FC("detail")].is<JsonVariant>())
                 {
-                    if (doc["detail"] == "all")
+                    if (doc[FC("detail")] == "all")
                     {
                         detail = DETAIL_ALL;
                     }
@@ -465,153 +587,161 @@ namespace esphome
             ws_reply(c, "", false);
         }
 
-        std::string WebServer::sensor_json(sensor::Sensor *obj, float value, JsonDetail start_config)
-        {
+    std::string WebServer::sensor_json(sensor::Sensor *obj, float value, JsonDetail start_config)
+    {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
+
+    const auto uom_ref = obj->get_unit_of_measurement_ref();
+    #if ESPHOME_VERSION_CODE < VERSION_CODE(2026, 1, 0)  
     std::string state;
     if (std::isnan(value)) {
       state = "NA";
     } else {
       state = value_accuracy_to_string(value, obj->get_accuracy_decimals());
-      if (!obj->get_unit_of_measurement().empty())
-        state += " " + obj->get_unit_of_measurement();
+      if (!uom_ref.empty())
+        state += " " + uom_ref;
     }
-    //set_json_icon_state_value(root, obj, "sensor-" + obj->get_object_id(), state, value, start_config); });
+    #else
 
-    set_json_icon_state_value(root, obj, "sensor-" + obj->get_object_id(), state, value, start_config);
+  char buf[VALUE_ACCURACY_MAX_LEN];
+  const char *state = std::isnan(value)
+                          ? "NA"
+                          : (value_accuracy_with_uom_to_buf(buf, value, obj->get_accuracy_decimals(), uom_ref), buf);
+    #endif
+    set_json_icon_state_value(root, obj, "sensor", state, value, start_config);
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
-      if (!obj->get_unit_of_measurement().empty())
-        root["uom"] = obj->get_unit_of_measurement();
+    this->add_sorting_info_(root, obj);
+      if (!uom_ref.empty())
+        root["uom"] = uom_ref;
     } });
         }
 #endif
 
+
+
+void WebServer::handle_wifisave(struct mg_connection *c, JsonObject doc) {
+ #ifdef USE_WIFI
+        std::string ssid="";
+        std::string psk="";
+        if (doc["ssid"].is<JsonVariant>()) 
+            ssid=std::string(doc["ssid"]);
+        if (doc["psk"].is<JsonVariant>())
+            psk=std::string(doc["psk"]);
+      ESP_LOGI(TAG,
+           "Requested WiFi Settings Change:\n"
+           "  SSID='%s'\n"
+           "  Password=" LOG_SECRET("'%s'"),
+           ssid.c_str(), psk.c_str());
+
+   if (ssid !="") {
+   wifi::global_wifi_component->save_wifi_sta(ssid, psk); 
+    ws_reply(c, "", true);
+    return;
+   }
+#endif
+ws_reply(c, "", false);
+   //request->redirect(ESPHOME_F("/?save"));
+}
+
 #ifdef USE_TEXT_SENSOR
-        void WebServer::on_text_sensor_update(text_sensor::TextSensor *obj, const std::string &state)
+
+         void WebServer::on_text_sensor_update(text_sensor::TextSensor *obj)
         {
-            // this->events_.send(this->text_sensor_json(obj, state, DETAIL_STATE).c_str(), "state");
-            std::string data = this->text_sensor_json(obj, state, DETAIL_STATE);
-            this->push(STATE, data.c_str());
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
+            this->push(STATE, text_sensor_json(obj,obj->state,DETAIL_STATE).c_str());
         }
+
+std::string WebServer::text_sensor_json(text_sensor::TextSensor *obj, const std::string &value,
+                                        JsonDetail start_config) {
+  json::JsonBuilder builder;
+  JsonObject root = builder.root();
+  root[FC("id_code")] = get_object_id(obj);
+  set_json_icon_state_value(root, obj, "text_sensor", value, value, start_config);
+  if (start_config == DETAIL_ALL) {
+    this->add_sorting_info_(root, obj);
+  }
+
+  return builder.serialize();
+}
 
         void WebServer::handle_text_sensor_request(mg_connection *c, JsonObject doc)
         {
             for (text_sensor::TextSensor *obj : App.get_text_sensors())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
                 auto detail = DETAIL_STATE;
-                if (doc.containsKey("detail"))
+                if (doc[FC("detail")].is<JsonVariant>() && doc[FC("detail")] == "all")
                 {
-                    if (doc["detail"] == "all")
-                    {
                         detail = DETAIL_ALL;
-                    }
                 }
                 std::string data = this->text_sensor_json(obj, obj->state, detail);
 
-                // request->send(200, "application/json", data.c_str());
-                // mg_http_reply(c, 200, "Content-Type: application/jsonAccess-Control-Allow-Origin: *\r\n\r\n", "%s", data.c_str());
                 ws_reply(c, data.c_str(), true);
                 return;
             }
             ws_reply(c, "", false);
         }
 
-        std::string WebServer::text_sensor_json(text_sensor::TextSensor *obj, const std::string &value,
-                                                JsonDetail start_config)
-        {
-            return json::build_json([this, obj, value, start_config](JsonObject root)
-                                    {
-   // set_json_icon_state_value(root, obj, "text_sensor-" +  obj->get_object_id(), value, value, start_config);
-  //root["id_code"]=obj->get_object_id(); });
-      set_json_icon_state_value(root, obj, "text_sensor-" + obj->get_object_id(), value, value, start_config);
-    root["id_code"] = obj->get_object_id();
-    if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
 
-        }
-      }
-    } });
-        }
 
 #endif
 
 #ifdef USE_SWITCH
-        void WebServer::on_switch_update(switch_::Switch *obj, bool state)
+        void WebServer::on_switch_update(switch_::Switch *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->switch_json(obj, state, DETAIL_STATE).c_str(), "state");
-            this->push(STATE, this->switch_json(obj, state, DETAIL_STATE).c_str());
+            this->push(STATE, this->switch_json(obj, obj->state, DETAIL_STATE).c_str());
         }
 
         std::string WebServer::switch_json(switch_::Switch *obj, bool value, JsonDetail start_config)
         {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
-    // set_json_icon_state_value(root, obj, "switch-" + obj->get_object_id(), value ? "ON" : "OFF", value, start_config);
-    // if (start_config == DETAIL_ALL) {
-    //   root["assumed_state"] = obj->assumed_state();
-    // } });
-        set_json_icon_state_value(root, obj, "switch-" + obj->get_object_id(), value ? "ON" : "OFF", value, start_config);
-    if (start_config == DETAIL_ALL) {
-      root["assumed_state"] = obj->assumed_state();
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
-    } });
+        set_json_icon_state_value(root, obj, "switch", value ? "ON" : "OFF", value, start_config);
+  if (start_config == DETAIL_ALL) {
+    this->add_sorting_info_(root, obj);
+  } });
         }
         void WebServer::handle_switch_request(mg_connection *c, JsonObject doc)
         {
             for (switch_::Switch *obj : App.get_switches())
             {
-                if (obj->get_object_id() != doc["oid"])
-                    continue;
-                // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
-                //  if (request->method() == HTTP_GET) {
-                // if (mg_vcasecmp(&hm->method, "GET") == 0) {
-                if (doc["action"] == "get")
+
+                if (get_object_id(obj) != doc[FC("oid")])
+                             continue;
+                if (doc[FC("action")] == "get")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
                     }
                     std::string data = this->switch_json(obj, obj->state, detail);
-                    // request->send(200, "application/json", data.c_str());
-                    // mg_http_reply(c, 200, "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", data.c_str());
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["action"] == "toggle")
+                else if (doc[FC("action")] == "toggle")
                 {
                     this->schedule_([obj]()
                                     { obj->toggle(); });
                     // mg_http_reply(c,200,"","");
                     ws_reply(c, "", true);
                 }
-                else if (doc["action"] == "turn_on")
+                else if (doc[FC("action")] == "turn_on")
                 {
                     this->schedule_([obj]()
                                     { obj->turn_on(); });
                     // mg_http_reply(c,200,"","");
                     ws_reply(c, "", true);
                 }
-                else if (doc["action"] == "turn_off")
+                else if (doc[FC("action")] == "turn_off")
                 {
                     this->schedule_([obj]()
                                     { obj->turn_off(); });
@@ -633,44 +763,34 @@ namespace esphome
             return json::build_json(
                 [this, obj, start_config](JsonObject root)
                 {
-                    // set_json_id(root, obj, "button-" + obj->get_object_id(), start_config); });
-                    set_json_id(root, obj, "button-" + obj->get_object_id(), start_config);
+                    set_json_id(root, obj, "button-" + get_object_id(obj), start_config);
                     if (start_config == DETAIL_ALL)
                     {
-                        if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end())
-                        {
-                            root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-                            if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end())
-                            {
-                                root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-                            }
-                        }
+                    this->add_sorting_info_(root, obj);
                     }
                 });
         }
 
         void WebServer::handle_button_request(mg_connection *c, JsonObject doc)
         {
-            // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (button::Button *obj : App.get_buttons())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
                 if (doc["method"] == "GET" && doc["method"] == "")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
                     }
                     std::string data = this->button_json(obj, detail);
-                    // request->send(200, "application/json", data.c_str());
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["method"] == "POST" && doc["action"] == "press")
+                else if (doc["method"] == "POST" && doc[FC("action")] == "press")
                 {
                     this->schedule_([obj]()
                                     { obj->press(); });
@@ -687,49 +807,43 @@ namespace esphome
 #endif
 
 #ifdef USE_BINARY_SENSOR
-        void WebServer::on_binary_sensor_update(binary_sensor::BinarySensor *obj, bool state)
-        {
-            // this->events_.send(this->binary_sensor_json(obj, state, DETAIL_STATE).c_str(), "state");
-            this->push(STATE, this->binary_sensor_json(obj, state, DETAIL_STATE).c_str());
-        }
 
-        std::string WebServer::binary_sensor_json(binary_sensor::BinarySensor *obj, bool value, JsonDetail start_config)
-        {
-            return json::build_json([this, obj, value, start_config](JsonObject root)
-                                    {
-                         //       set_json_state_value(root, obj, "binary_sensor-" + obj->get_object_id(), value ? "ON" : "OFF", value, start_config);
-                            //    root["id_code"] = obj->get_object_id(); });
-    set_json_icon_state_value(root, obj, "binary_sensor-" + obj->get_object_id(), value ? "ON" : "OFF", value,
-                              start_config);
-    root["id_code"] = obj->get_object_id();
-    if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
+  
 
-        }
-      }
-    } });
-        }
+        void WebServer::on_binary_sensor_update(binary_sensor::BinarySensor *obj)
+        {
+          if (!this->include_internal_ && obj->is_internal())
+                 return;
+            this->push(STATE, binary_sensor_json(obj,obj->state,DETAIL_STATE).c_str());
+         }
+
+std::string WebServer::binary_sensor_json(binary_sensor::BinarySensor *obj, bool value, JsonDetail start_config) {
+  json::JsonBuilder builder;
+  JsonObject root = builder.root();
+  root[FC("id_code")] = get_object_id(obj);
+  set_json_icon_state_value(root, obj, "binary_sensor" , value ? "ON" : "OFF", value, start_config);
+  if (start_config == DETAIL_ALL) {
+    this->add_sorting_info_(root, obj);
+  }
+
+  return builder.serialize();
+}
 
         void WebServer::handle_binary_sensor_request(mg_connection *c, JsonObject doc)
         {
             for (binary_sensor::BinarySensor *obj : App.get_binary_sensors())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
                 auto detail = DETAIL_STATE;
-                if (doc.containsKey("detail"))
+                if (doc[FC("detail")].is<JsonVariant>())
                 {
-                    if (doc["detail"] == "all")
+                    if (doc[FC("detail")] == "all")
                     {
                         detail = DETAIL_ALL;
                     }
                 }
                 std::string data = this->binary_sensor_json(obj, obj->state, detail);
-                // request->send(200, "application/json", data.c_str());
-                // mg_http_reply(c, 200, "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", data.c_str());
                 ws_reply(c, data.c_str(), true);
                 return;
             }
@@ -740,6 +854,8 @@ namespace esphome
 #ifdef USE_FAN
         void WebServer::on_fan_update(fan::Fan *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->p.send(this->fan_json(obj, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->fan_json(obj, DETAIL_STATE).c_str());
         }
@@ -748,7 +864,7 @@ namespace esphome
 
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    // set_json_state_value(root, obj, "fan-" + obj->get_object_id(), obj->state ? "ON" : "OFF", obj->state, start_config);
+    // set_json_state_value(root, obj, "fan-" + get_object_id(obj), obj->state ? "ON" : "OFF", obj->state, start_config);
     // const auto traits = obj->get_traits();
     // if (traits.supports_speed()) {
     //   root["speed_level"] = obj->speed;
@@ -756,7 +872,7 @@ namespace esphome
     // }
     // if (obj->get_traits().supports_oscillation())
     //   root["oscillation"] = obj->oscillating; });
-        set_json_icon_state_value(root, obj, "fan-" + obj->get_object_id(), obj->state ? "ON" : "OFF", obj->state,
+        set_json_icon_state_value(root, obj, "fan", obj->state ? "ON" : "OFF", obj->state,
                               start_config);
     const auto traits = obj->get_traits();
     if (traits.supports_speed()) {
@@ -766,13 +882,7 @@ namespace esphome
     if (obj->get_traits().supports_oscillation())
       root["oscillation"] = obj->oscillating;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
         void WebServer::handle_fan_request(mg_connection *c, JsonObject doc)
@@ -780,7 +890,7 @@ namespace esphome
 
             for (fan::Fan *obj : App.get_fans())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -788,9 +898,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -800,19 +910,19 @@ namespace esphome
                     // mg_http_reply(c, 200, "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", data.c_str());
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["action"] == "toggle")
+                else if (doc[FC("action")] == "toggle")
                 {
                     this->schedule_([obj]()
                                     { obj->toggle().perform(); });
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["action"] == "turn_on")
+                else if (doc[FC("action")] == "turn_on")
                 {
                     auto call = obj->turn_on();
                     // if (request->hasParam("speed_level")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"speed_level",buf,sizeof(buf)) > 0) {
-       if (doc.containsKey("speed_level") {
+       if (doc["speed_level"].is<JsonVariant>()) {
                         // auto speed_level = buf;
                         auto val = parse_number<int>(doc["speed_level"]);
                         if (!val.has_value())
@@ -826,7 +936,7 @@ namespace esphome
     //char buf[100];
     //if (mg_http_get_var(&hm->body,"oscillation",buf,sizeof(buf)) > 0) {         
      //   auto speed = buf;
-        if (doc.containsKey("oscillation")) {
+        if (doc["oscillation"].is<JsonVariant>()) {
                         auto val = parse_on_off(doc["oscillation"]);
                         switch (val)
                         {
@@ -848,7 +958,7 @@ namespace esphome
                         call.perform(); });
             ws_reply(c,"",true);
                 }
-                else if (doc["action"] == "turn_off")
+                else if (doc[FC("action")] == "turn_off")
                 {
                     this->schedule_([obj]()
                                     { obj->turn_off().perform(); });
@@ -868,6 +978,8 @@ namespace esphome
 #ifdef USE_LIGHT
         void WebServer::on_light_update(light::LightState *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->light_json(obj, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->light_json(obj, DETAIL_STATE).c_str());
         }
@@ -876,7 +988,7 @@ namespace esphome
 
             for (light::LightState *obj : App.get_lights())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -884,9 +996,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -896,20 +1008,20 @@ namespace esphome
                     // mg_http_reply(c, 200, "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", data.c_str());
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["action"] == "toggle")
+                else if (doc[FC("action")] == "toggle")
                 {
                     this->schedule_([obj]()
                                     { obj->toggle().perform(); });
                     // mg_http_reply(c,200,"","");
                     ws_reply(c, "", true);
                 }
-                else if (doc["action"] == "turn_on")
+                else if (doc[FC("action")] == "turn_on")
                 {
                     auto call = obj->turn_on();
                     // if (request->hasParam("brightness")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"brightness",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("brightness"))
+                    if (doc["brightness"].is<JsonVariant>())
                     {
                         std::string num = doc["brightness"];
                         auto brightness = parse_number<float>(num);
@@ -921,7 +1033,7 @@ namespace esphome
                     // if (request->hasParam("r")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"r",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("r"))
+                    if (doc["r"].is<JsonVariant>())
                     {
                         std::string num = doc["r"];
                         auto r = parse_number<float>(num);
@@ -933,7 +1045,7 @@ namespace esphome
                     // if (request->hasParam("g")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"g",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("g"))
+                    if (doc["g"].is<JsonVariant>())
                     {
                         std::string num = doc["g"];
                         auto g = parse_number<float>(num);
@@ -945,7 +1057,7 @@ namespace esphome
                     // if (request->hasParam("b")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"b",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("b"))
+                    if (doc["b"].is<JsonVariant>())
                     {
                         std::string num = doc["b"];
                         auto b = parse_number<float>(num);
@@ -957,7 +1069,7 @@ namespace esphome
                     // if (request->hasParam("white_value")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"white_value",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("white_value"))
+                    if (doc["white_value"].is<JsonVariant>())
                     {
                         std::string num = doc["white_value"];
                         auto white_value = parse_number<float>(num);
@@ -969,7 +1081,7 @@ namespace esphome
                     // if (request->hasParam("color_temp")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"color_temp",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("color_temp"))
+                    if (doc["color_temp"].is<JsonVariant>())
                     {
                         std::string num = doc["color_temp"];
                         auto color_temp = parse_number<float>(num);
@@ -981,7 +1093,7 @@ namespace esphome
                     // if (request->hasParam("flash")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"flash",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("flash"))
+                    if (doc["flash"].is<JsonVariant>())
                     {
                         std::string num = doc["flash"];
                         auto flash = parse_number<uint32_t>(num);
@@ -993,7 +1105,7 @@ namespace esphome
                     // if (request->hasParam("transition")) {
                     //  char buf[100];
                     // if (mg_http_get_var(&hm->body,"transition",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("transition"))
+                    if (doc["transition"].is<JsonVariant>())
                     {
                         std::string num = doc["transition"];
                         auto transition = parse_number<uint32_t>(num);
@@ -1005,7 +1117,7 @@ namespace esphome
                     // if (request->hasParam("effect")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"effect",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("effect"))
+                    if (doc["effect"].is<JsonVariant>())
                     {
                         const char *effect = doc["effect"];
                         call.set_effect(effect);
@@ -1015,13 +1127,13 @@ namespace esphome
                                     { call.perform(); });
                     ws_reply(c, "", true);
                 } // else if (match.method == "turn_off") {
-                else if (doc["action"] == "turn_off")
+                else if (doc[FC("action")] == "turn_off")
                 {
                     auto call = obj->turn_off();
                     // if (request->hasParam("transition")) {
                     // char buf[100];
                     // if (mg_http_get_var(&hm->body,"transition",buf,sizeof(buf)) > 0) {
-                    if (doc.containsKey("transition"))
+                    if (doc["transition"].is<JsonVariant>())
                     {
                         std::string num = doc["transition"];
                         auto transition = parse_number<uint32_t>(num);
@@ -1047,7 +1159,7 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    // set_json_id(root, obj, "light-" + obj->get_object_id(), start_config);
+    // set_json_id(root, obj, "light-" + get_object_id(obj), start_config);
     // root["state"] = obj->remote_values.is_on() ? "ON" : "OFF";
 
     // light::LightJSONSchema::dump_json(*obj, root);
@@ -1058,7 +1170,7 @@ namespace esphome
     //     opt.add(option->get_name());
     //   }
     // } });
-        set_json_id(root, obj, "light-" + obj->get_object_id(), start_config);
+        set_json_id(root, obj, "light-" + get_object_id(obj), start_config);
     root["state"] = obj->remote_values.is_on() ? "ON" : "OFF";
 
     light::LightJSONSchema::dump_json(*obj, root);
@@ -1068,12 +1180,7 @@ namespace esphome
       for (auto const &option : obj->get_effects()) {
         opt.add(option->get_name());
       }
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
@@ -1081,6 +1188,8 @@ namespace esphome
 #ifdef USE_COVER
         void WebServer::on_cover_update(cover::Cover *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->cover_json(obj, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->cover_json(obj, DETAIL_STATE).c_str());
         }
@@ -1089,7 +1198,7 @@ namespace esphome
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (cover::Cover *obj : App.get_covers())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -1097,9 +1206,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1113,22 +1222,22 @@ namespace esphome
 
                 auto call = obj->make_call();
                 // if (match.method == "open") {
-                if (doc["action"] == "open")
+                if (doc[FC("action")] == "open")
                 {
                     call.set_command_open();
                     // } else if (match.method == "close") {
                 }
-                else if (doc["action"] == "close")
+                else if (doc[FC("action")] == "close")
                 {
                     call.set_command_close();
                     //} else if (match.method == "stop") {
                 }
-                else if (doc["action"] == "stop")
+                else if (doc[FC("action")] == "stop")
                 {
                     call.set_command_stop();
                     // } else if (match.method != "set") {
                 }
-                else if (doc["action"] != "set")
+                else if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
@@ -1140,7 +1249,7 @@ namespace esphome
                 //(request->hasParam("tilt") && !traits.get_supports_tilt())) {
                 // char buf[50];
                 // bool p= (mg_http_get_var(&hm->body,"position",buf,sizeof(buf)) > 0);
-                if ((doc.containsKey("position") && !traits.get_supports_position()) || (doc.containsKey("tilt") && !traits.get_supports_tilt()))
+                if ((doc["position"].is<JsonVariant>() && !traits.get_supports_position()) || (doc["tilt"].is<JsonVariant>() && !traits.get_supports_tilt()))
                 {
 
                     // bool t= (mg_http_get_var(&hm->body,"tilt",buf,sizeof(buf)) > 0);
@@ -1152,7 +1261,7 @@ namespace esphome
 
                 // char buf[100];
                 // if (mg_http_get_var(&hm->body,"position",buf,sizeof(buf)) > 0) {
-                if (doc.containsKey("position"))
+                if (doc["position"].is<JsonVariant>())
                 {
                     auto position = parse_number<float>(doc["position"]);
                     if (position.has_value())
@@ -1161,7 +1270,7 @@ namespace esphome
                     }
                 }
                 // if (mg_http_get_var(&hm->body,"tilt",buf,sizeof(buf)) > 0) {
-                if (doc.containsKey("tilt"))
+                if (doc["tilt"].is<JsonVariant>())
                 {
                     auto tilt = parse_number<float>(doc["tilt"]);
                     if (tilt.has_value())
@@ -1181,13 +1290,13 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    // set_json_state_value(root, obj, "cover-" + obj->get_object_id(), obj->is_fully_closed() ? "CLOSED" : "OPEN",
+    // set_json_state_value(root, obj, "cover-" + get_object_id(obj), obj->is_fully_closed() ? "CLOSED" : "OPEN",
     //                      obj->position, start_config);
     // root["current_operation"] = cover::cover_operation_to_str(obj->current_operation);
 
     // if (obj->get_traits().get_supports_tilt())
     //   root["tilt"] = obj->tilt; });
-      set_json_icon_state_value(root, obj, "cover-" + obj->get_object_id(), obj->is_fully_closed() ? "CLOSED" : "OPEN",
+      set_json_icon_state_value(root, obj, "cover" , obj->is_fully_closed() ? "CLOSED" : "OPEN",
                               obj->position, start_config);
     root["current_operation"] = cover::cover_operation_to_str(obj->current_operation);
 
@@ -1196,28 +1305,25 @@ namespace esphome
     if (obj->get_traits().get_supports_tilt())
       root["tilt"] = obj->tilt;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
 
 #ifdef USE_NUMBER
-        void WebServer::on_number_update(number::Number *obj, float state)
+        void WebServer::on_number_update(number::Number *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->number_json(obj, state, DETAIL_STATE).c_str(), "state");
-            this->push(STATE, this->number_json(obj, state, DETAIL_STATE).c_str());
+            this->push(STATE, this->number_json(obj, obj->state, DETAIL_STATE).c_str());
         }
         void WebServer::handle_number_request(mg_connection *c, JsonObject doc)
         {
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (auto *obj : App.get_numbers())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -1225,9 +1331,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1237,7 +1343,7 @@ namespace esphome
                     return;
                 }
 
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
@@ -1245,9 +1351,9 @@ namespace esphome
 
                 auto call = obj->make_call();
 
-                if (doc.containsKey("value"))
+                if (doc[FC("value")].is<JsonVariant>())
                 {
-                    std::string value = doc["value"];
+                    std::string value = doc[FC("value")];
                     auto value = parse_number<float>(value);
                     if (value.has_value())
                         call.set_value(*value);
@@ -1257,32 +1363,16 @@ namespace esphome
                                 { call.perform(); });
                 ws_reply(c, "", true);
                 return;
-            }
-            ws_reply(c, "", false);
+            }            ws_reply(c, "", false);
         }
 
         std::string WebServer::number_json(number::Number *obj, float value, JsonDetail start_config)
         {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
-    // set_json_id(root, obj, "number-" + obj->get_object_id(), start_config);
-    // if (start_config == DETAIL_ALL) {
-    //   root["min_value"] = obj->traits.get_min_value();
-    //   root["max_value"] = obj->traits.get_max_value();
-    //   root["step"] = obj->traits.get_step();
-    //   root["mode"] = (int) obj->traits.get_mode();
-    // }
-    // if (std::isnan(value)) {
-    //   root["value"] = "\"NaN\"";
-    //   root["state"] = "NA";
-    // } else {
-    //   root["value"] = value;
-    //   std::string state = value_accuracy_to_string(value, step_to_accuracy_decimals(obj->traits.get_step()));
-    //   if (!obj->traits.get_unit_of_measurement().empty())
-    //     state += " " + obj->traits.get_unit_of_measurement();
-    //   root["state"] = state;
-    // } });
-       set_json_id(root, obj, "number-" + obj->get_object_id(), start_config);
+       set_json_id(root, obj, "number-" + get_object_id(obj), start_config);
+
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 1, 0)  
     if (start_config == DETAIL_ALL) {
       root["min_value"] =
           value_accuracy_to_string(obj->traits.get_min_value(), step_to_accuracy_decimals(obj->traits.get_step()));
@@ -1291,23 +1381,39 @@ namespace esphome
       root["step"] =
           value_accuracy_to_string(obj->traits.get_step(), step_to_accuracy_decimals(obj->traits.get_step()));
       root["mode"] = (int) obj->traits.get_mode();
-      if (!obj->traits.get_unit_of_measurement().empty())
-        root["uom"] = obj->traits.get_unit_of_measurement();
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+      if (!obj->traits.get_unit_of_measurement_ref().empty())
+        root["uom"] = obj->traits.get_unit_of_measurement_ref();
+            this->add_sorting_info_(root, obj);
     }
+#else 
+ char val_buf[VALUE_ACCURACY_MAX_LEN];
+  char state_buf[VALUE_ACCURACY_MAX_LEN];
+  const char *val_str = std::isnan(value) ? "\"NaN\"" : (value_accuracy_to_buf(val_buf, value, accuracy), val_buf);
+  const char *state_str =
+      std::isnan(value) ? "NA" : (value_accuracy_with_uom_to_buf(state_buf, value, accuracy, uom_ref), state_buf);
+  set_json_icon_state_value(root, obj, "number", state_str, val_str, start_config);
+  if (start_config == DETAIL_ALL) {
+    // ArduinoJson copies the string immediately, so we can reuse val_buf
+    root[ESPHOME_F("min_value")] = (value_accuracy_to_buf(val_buf, obj->traits.get_min_value(), accuracy), val_buf);
+    root[ESPHOME_F("max_value")] = (value_accuracy_to_buf(val_buf, obj->traits.get_max_value(), accuracy), val_buf);
+    root[ESPHOME_F("step")] = (value_accuracy_to_buf(val_buf, obj->traits.get_step(), accuracy), val_buf);
+    root[ESPHOME_F("mode")] = (int) obj->traits.get_mode();
+    if (!uom_ref.empty())
+      root[ESPHOME_F("uom")] = uom_ref;
+          this->add_sorting_info_(root, obj);
+    }
+
+#endif
+
+
     if (std::isnan(value)) {
       root["value"] = "\"NaN\"";
       root["state"] = "NA";
     } else {
       root["value"] = value_accuracy_to_string(value, step_to_accuracy_decimals(obj->traits.get_step()));
       std::string state = value_accuracy_to_string(value, step_to_accuracy_decimals(obj->traits.get_step()));
-      if (!obj->traits.get_unit_of_measurement().empty())
-        state += " " + obj->traits.get_unit_of_measurement();
+      if (!obj->traits.get_unit_of_measurement_ref().empty())
+        state += " " + obj->traits.get_unit_of_measurement_ref();
       root["state"] = state;
     } });
         }
@@ -1316,6 +1422,8 @@ namespace esphome
 #ifdef USE_DATETIME_DATE
         void WebServer::on_date_update(datetime::DateEntity *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->date_json(obj, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->date_json(obj, DETAIL_STATE).c_str());
         }
@@ -1325,7 +1433,7 @@ namespace esphome
             for (auto *obj : App.get_dates())
             {
 
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -1333,9 +1441,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1345,13 +1453,13 @@ namespace esphome
                     return;
                 }
 
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
                 }
 
-                // if (obj->get_object_id() != match.id)
+                // if (get_object_id(obj) != match.id)
                 //   continue;
                 // if (request->method() == HTTP_GET && match.method.empty()) {
                 //   auto detail = DETAIL_STATE;
@@ -1369,9 +1477,9 @@ namespace esphome
                 // }
 
                 auto call = obj->make_call();
-                if (doc.containsKey("value"))
+                if (doc[FC("value")].is<JsonVariant>())
                 {
-                    std::string value = doc["value"];
+                    std::string value = doc[FC("value")];
                     call.set_date(value);
                 }
                 else
@@ -1404,17 +1512,12 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    set_json_id(root, obj, "date-" + obj->get_object_id(), start_config);
+    set_json_id(root, obj, "date-" + get_object_id(obj), start_config);
     std::string value = str_sprintf("%d-%02d-%02d", obj->year, obj->month, obj->day);
     root["value"] = value;
     root["state"] = value;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif // USE_DATETIME_DATE
@@ -1422,6 +1525,8 @@ namespace esphome
 #ifdef USE_DATETIME_TIME
         void WebServer::on_time_update(datetime::TimeEntity *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             this->push(STATE, this->time_json(obj, DETAIL_STATE).c_str());
             // this->events_.send(this->time_json(obj, DETAIL_STATE).c_str(), "state");
         }
@@ -1430,7 +1535,7 @@ namespace esphome
             for (auto *obj : App.get_times())
             {
 
-                // if (obj->get_object_id() != match.id)
+                // if (get_object_id(obj) != match.id)
                 //   continue;
                 // if (request->method() == HTTP_GET && match.method.empty()) {
                 //   auto detail = DETAIL_STATE;
@@ -1462,7 +1567,7 @@ namespace esphome
                 // this->schedule_([call]() mutable { call.perform(); });
                 // request->send(200);
                 // return;
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -1470,9 +1575,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1482,16 +1587,16 @@ namespace esphome
                     return;
                 }
 
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
                 }
 
                 auto call = obj->make_call();
-                if (doc.containsKey("value"))
+                if (doc[FC("value")].is<JsonVariant>())
                 {
-                    std::string value = doc["value"];
+                    std::string value = doc[FC("value")];
                     call.set_time(value);
                 }
                 else
@@ -1512,17 +1617,12 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    set_json_id(root, obj, "time-" + obj->get_object_id(), start_config);
+    set_json_id(root, obj, "time-" + get_object_id(obj), start_config);
     std::string value = str_sprintf("%02d:%02d:%02d", obj->hour, obj->minute, obj->second);
     root["value"] = value;
     root["state"] = value;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif // USE_DATETIME_TIME
@@ -1530,6 +1630,8 @@ namespace esphome
 #ifdef USE_DATETIME_DATETIME
         void WebServer::on_datetime_update(datetime::DateTimeEntity *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             this->push(STATE, this->datetime_json(obj, DETAIL_STATE).c_str());
             // this->events_.send(this->datetime_json(obj, DETAIL_STATE).c_str(), "state");
         }
@@ -1538,7 +1640,7 @@ namespace esphome
             for (auto *obj : App.get_datetimes())
             {
 
-                // if (obj->get_object_id() != match.id)
+                // if (get_object_id(obj) != match.id)
                 //   continue;
                 // if (request->method() == HTTP_GET && match.method.empty())
                 // {
@@ -1577,7 +1679,7 @@ namespace esphome
                 // request->send(200);
                 // return;
 
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")]
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -1585,9 +1687,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1597,16 +1699,16 @@ namespace esphome
                     return;
                 }
 
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
                 }
 
                 auto call = obj->make_call();
-                if (doc.containsKey("value"))
+                if (doc[FC("value")].is<JsonVariant>())
                 {
-                    std::string value = doc["value"];
+                    std::string value = doc[FC("value")];
                     call.set_datetime(value);
                 }
                 else
@@ -1628,18 +1730,13 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    set_json_id(root, obj, "datetime-" + obj->get_object_id(), start_config);
+    set_json_id(root, obj, "datetime-" + get_object_id(obj), start_config);
     std::string value = str_sprintf("%d-%02d-%02d %02d:%02d:%02d", obj->year, obj->month, obj->day, obj->hour,
                                     obj->minute, obj->second);
     root["value"] = value;
     root["state"] = value;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif // USE_DATETIME_DATETIME
@@ -1655,7 +1752,7 @@ namespace esphome
         {
             for (event::Event *obj : App.get_events())
             {
-                // if (obj->get_object_id() != match.id)
+                // if (get_object_id(obj) != match.id)
                 //   continue;
 
                 // if (request->method() == HTTP_GET && match.method.empty()) {
@@ -1668,15 +1765,15 @@ namespace esphome
                 //   request->send(200, "application/json", data.c_str());
                 //   return;
 
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1693,7 +1790,7 @@ namespace esphome
         {
             return json::build_json([this, obj, event_type, start_config](JsonObject root)
                                     {
-    set_json_id(root, obj, "event-" + obj->get_object_id(), start_config);
+    set_json_id(root, obj, "event-" + get_object_id(obj), start_config);
     if (!event_type.empty()) {
       root["event_type"] = event_type;
     }
@@ -1703,12 +1800,7 @@ namespace esphome
         event_types.add(event_type);
       }
       root["device_class"] = obj->get_device_class();
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
@@ -1716,6 +1808,7 @@ namespace esphome
 #ifdef USE_UPDATE
         void WebServer::on_update(update::UpdateEntity *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
             this->push(STATE, this->update_json(obj, DETAIL_STATE).c_str());
             // this->events_.send(this->update_json(obj, DETAIL_STATE).c_str(), "state");
         }
@@ -1724,7 +1817,7 @@ namespace esphome
             for (update::UpdateEntity *obj : App.get_updates())
             {
 
-                // if (obj->get_object_id() != match.id)
+                // if (get_object_id(obj) != match.id)
                 //   continue;
 
                 // if (request->method() == HTTP_GET && match.method.empty()) {
@@ -1746,15 +1839,15 @@ namespace esphome
                 // this->schedule_([obj]() mutable { obj->perform(); });
                 // request->send(200);
                 // return;
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1764,7 +1857,7 @@ namespace esphome
                     return;
                 }
 
-                if (doc["action"] != "install")
+                if (doc[FC("action")] != "install")
                 {
                     ws_reply(c, "", false);
                     return;
@@ -1781,7 +1874,7 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    set_json_id(root, obj, "update-" + obj->get_object_id(), start_config);
+    set_json_id(root, obj, "update-" + get_object_id(obj), start_config);
     root["value"] = obj->update_info.latest_version;
     switch (obj->state) {
       case update::UPDATE_STATE_NO_UPDATE:
@@ -1802,12 +1895,7 @@ namespace esphome
       root["title"] = obj->update_info.title;
       root["summary"] = obj->update_info.summary;
       root["release_url"] = obj->update_info.release_url;
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
@@ -1815,6 +1903,8 @@ namespace esphome
 #ifdef USE_VALVE
         void WebServer::on_valve_update(valve::Valve *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             this->push(STATE, this->valve_json(obj, DETAIL_STATE).c_str());
             // this->events_.send(this->valve_json(obj, DETAIL_STATE).c_str(), "state");
         }
@@ -1823,15 +1913,15 @@ namespace esphome
             for (valve::Valve *obj : App.get_valves())
             {
 
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1841,28 +1931,28 @@ namespace esphome
                     return;
                 }
                 auto call = obj->make_call();
-                if (doc["action"] == "open")
+                if (doc[FC("action")] == "open")
                 {
                     call.set_command_open();
                 }
-                else if (doc["action"] == "close")
+                else if (doc[FC("action")] == "close")
                 {
                     call.set_command_close();
                 }
-                else if (doc["action"] == "stop")
+                else if (doc[FC("action")] == "stop")
                 {
                     call.set_command_stop();
                 }
-                else if (doc["action"] == "toggle")
+                else if (doc[FC("action")] == "toggle")
                 {
                     call.set_command_toggle();
                 }
-                else if (doc["action"] != "set")
+                else if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                 }
 
-                if (doc.containsKey("position"))
+                if (doc["position"].is<JsonVariant>())
                 {
                     std::string value = doc["position"];
 
@@ -1884,28 +1974,25 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    set_json_icon_state_value(root, obj, "valve-" + obj->get_object_id(), obj->is_fully_closed() ? "CLOSED" : "OPEN",
+    set_json_icon_state_value(root, obj, "valve" , obj->is_fully_closed() ? "CLOSED" : "OPEN",
                               obj->position, start_config);
     root["current_operation"] = valve::valve_operation_to_str(obj->current_operation);
 
     if (obj->get_traits().get_supports_position())
       root["position"] = obj->position;
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
 
 #ifdef USE_TEXT
-        void WebServer::on_text_update(text::Text *obj, const std::string &state)
+        void WebServer::on_text_update(text::Text *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->text_json(obj, state, DETAIL_STATE).c_str(), "state");
-            this->push(STATE, this->text_json(obj, state, DETAIL_STATE).c_str());
+            this->push(STATE, this->text_json(obj, obj->state, DETAIL_STATE).c_str());
         }
 
         void WebServer::handle_text_request(mg_connection *c, JsonObject doc)
@@ -1913,15 +2000,15 @@ namespace esphome
 
             for (auto *obj : App.get_texts())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -1930,15 +2017,15 @@ namespace esphome
                     ws_reply(c, data.c_str(), true);
                     return;
                 }
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
                 }
                 auto call = obj->make_call();
-                if (doc.containsKey("value"))
+                if (doc[FC("value")].is<JsonVariant>())
                 {
-                    call.set_value(doc["value"]);
+                    call.set_value(doc[FC("value")]);
                     this->defer([call]() mutable
                                 { call.perform(); });
                 }
@@ -1953,7 +2040,7 @@ namespace esphome
         {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
-    // set_json_id(root, obj, "text-" + obj->get_object_id(), start_config);
+    // set_json_id(root, obj, "text-" + get_object_id(obj), start_config);
     // if (start_config == DETAIL_ALL) {
     //   root["mode"] = (int) obj->traits.get_mode();
     // }
@@ -1966,7 +2053,7 @@ namespace esphome
     //   root["state"] = value;
     // }
     // root["value"] = value; });
-        set_json_id(root, obj, "text-" + obj->get_object_id(), start_config);
+        set_json_id(root, obj, "text-" + get_object_id(obj), start_config);
     root["min_length"] = obj->traits.get_min_length();
     root["max_length"] = obj->traits.get_max_length();
     root["pattern"] = obj->traits.get_pattern();
@@ -1978,12 +2065,7 @@ namespace esphome
     root["value"] = value;
     if (start_config == DETAIL_ALL) {
       root["mode"] = (int) obj->traits.get_mode();
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
@@ -2000,22 +2082,22 @@ namespace esphome
         void WebServer::handle_auth_request(mg_connection *c, JsonObject doc)
         {
 
-            if (doc["action"] != "set")
+            if (doc[FC("action")] != "set")
             {
                 ws_reply(c, "", false);
                 return;
             }
-            if (doc.containsKey("cid"))
+            if (doc["cid"].is<JsonVariant>())
             {
                 // cid = toInt(doc["partition"],10);
                 unsigned long ul = (unsigned long)doc["cid"];
-                for (struct mg_connection *cl = mgr.conns; cl != NULL; cl = cl->next)
-                {
+              for (mg_connection * cl=mgr.conns ;cl != NULL; cl = cl->next)
+                 {
                     if (cl->id == ul)
                     {
-                        cl->data[1] = 1;
-                        ESP_LOGD(TAG, "Set auth conn %d as 1", cl->id);
-                        entities_iterator_.begin(this->include_internal_);
+                        cl->is_authenticated=1;
+                        entities_iterator_.begin(this->include_internal_); //ok authenticated so we can start sending data
+                        ESP_LOGD(TAG, "Set auth conn %d as authenticated", cl->id);
                         break;
                     }
                 }
@@ -2023,6 +2105,7 @@ namespace esphome
                 return;
             }
             ws_reply(c, "", false);
+
         }
 
         bool WebServer::callKeyService(const char *buf, int partition)
@@ -2050,31 +2133,29 @@ namespace esphome
 
             if (doc["method"] == "GET")
             {
-                if (doc["action"] == "getconfig" && strlen(get_keypad_config()) > 0)
+
+                if (doc[FC("action")] == "getconfig")
                 {
-                    ws_reply(c, get_keypad_config(), true);
+                    std::string enc;
+                    get_keypad_config(enc);
+                    ws_reply(c, enc.c_str(), true);
                     return;
                 }
                 // ws_reply(c,"",true);
                 // return;
             }
-            if (doc["action"] != "set")
+            if (doc[FC("action")] != "set")
             {
                 ws_reply(c, "", false);
                 return;
             }
-            // if (doc.containsKey("config")) {
-            //    String conf=doc["config"].as<String>();
-            //     set_keypad_config((char *)conf.c_str());
-            //     ws_reply(c, "", true);
-            //     return;
-            // }
+
             int partition = 1; // get default partition
-            if (doc.containsKey("partition"))
+            if (doc["partition"].is<JsonVariant>())
             {
                 partition = toInt(doc["partition"], 10);
             }
-            if (doc.containsKey("keys"))
+            if (doc["keys"].is<JsonVariant>())
             {
                 if (callKeyService(doc["keys"], partition))
                     ws_reply(c, "", true);
@@ -2086,17 +2167,19 @@ namespace esphome
         }
 
 #ifdef USE_SELECT
-        void WebServer::on_select_update(select::Select *obj, const std::string &state, size_t index)
+        void WebServer::on_select_update(select::Select *obj)
         {
+            f (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->select_json(obj, state, DETAIL_STATE).c_str(), "state");
-            this->push(STATE, this->select_json(obj, state, DETAIL_STATE).c_str());
+            this->push(STATE, this->select_json(obj, obj->state, DETAIL_STATE).c_str());
         }
         void WebServer::handle_select_request(mg_connection *c, JsonObject doc)
         {
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (auto *obj : App.get_selects())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -2104,9 +2187,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -2119,7 +2202,7 @@ namespace esphome
                 }
 
                 //  if (match.method != "set") {
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
@@ -2128,7 +2211,7 @@ namespace esphome
                 auto call = obj->make_call();
 
                 // if (mg_http_get_var(&hm->body,"option",buf,sizeof(buf)) > 0) {
-                if (doc.containsKey("option"))
+                if (doc["option"].is<JsonVariant>())
                 {
                     auto option = doc["option"];
                     // if (request->hasParam("option")) {
@@ -2147,35 +2230,25 @@ namespace esphome
         {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
-    // set_json_state_value(root, obj, "select-" + obj->get_object_id(), value, value, start_config);
-    // if (start_config == DETAIL_ALL) {
-    //   JsonArray opt = root.createNestedArray("option");
-    //   for (auto &option : obj->traits.get_options()) {
-    //     opt.add(option);
-    //   }
-    // } });
-        set_json_icon_state_value(root, obj, "select-" + obj->get_object_id(), value, value, start_config);
+
+        set_json_icon_state_value(root, obj, "select", value, value, start_config);
     if (start_config == DETAIL_ALL) {
       JsonArray opt = root.createNestedArray("option");
       for (auto &option : obj->traits.get_options()) {
         opt.add(option);
       }
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
 #endif
 
 // Longest: HORIZONTAL
 #define PSTR_LOCAL(mode_s) strncpy_P(buf, (PGM_P)((mode_s)), 15)
-
-#ifdef USE_CLIMATE
+#ifdef USE_CLIMATE_XX //not supported
         void WebServer::on_climate_update(climate::Climate *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->climate_json(obj, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->climate_json(obj, DETAIL_STATE).c_str());
         }
@@ -2185,7 +2258,7 @@ namespace esphome
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (auto *obj : App.get_climates())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -2193,9 +2266,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -2208,7 +2281,7 @@ namespace esphome
                 }
 
                 // if (match.method != "set") {
-                if (doc["action"] != "set")
+                if (doc[FC("action")] != "set")
                 {
                     ws_reply(c, "", false);
                     return;
@@ -2217,7 +2290,7 @@ namespace esphome
                 auto call = obj->make_call();
                 // char buf[100];
                 // if (mg_http_get_var(&hm->body,"mode",buf,sizeof(buf)) > 0) {
-                if (doc.containsKey("mode"))
+                if (doc["mode"].is<JsonVariant>())
                 {
                     // if (request->hasParam("mode")) {
                     //  auto mode = request->getParam("mode")->value();
@@ -2226,7 +2299,7 @@ namespace esphome
                 }
                 // if (mg_http_get_var(&hm->body,"target_temperature_high",buf,sizeof(buf)) > 0) {
                 // auto target_temperature_high=buf;
-                if (doc.containsKey("target_temperature_high"))
+                if (doc["target_temperature_high"].is<JsonVariant>())
                 {
 
                     // if (request->hasParam("target_temperature_high")) {
@@ -2238,7 +2311,7 @@ namespace esphome
                 // if (request->hasParam("target_temperature_low")) {
                 // auto target_temperature_low = parse_number<float>(request->getParam("target_temperature_low")->value().c_str());
                 // if (mg_http_get_var(&hm->body,"target_temperature_low",buf,sizeof(buf)) > 0) {
-                if (doc.containsKey("target_temperature_low"))
+                if (doc["target_temperature_low"].is<JsonVariant>())
                 {
                     auto target_temperature_low = parse_number<float>(doc["target_temperature_low"]);
                     if (target_temperature_low.has_value())
@@ -2248,7 +2321,7 @@ namespace esphome
                 // if (request->hasParam("target_temperature")) {
                 //  auto target_temperature = parse_number<float>(request->getParam("target_temperature")->value().c_str());
                 // if (mg_http_get_var(&hm->body,"target_temperature",buf,sizeof(buf)) > 0) {
-                if (doc.contains("target_temperature"))
+                if (doc["target_temperature"].is<JsonVariant>())
                 {
                     auto target_temperature = parse_number<float>(doc["target_temperature"]);
                     if (target_temperature.has_value())
@@ -2267,7 +2340,7 @@ namespace esphome
         {
             return json::build_json([this, obj, start_config](JsonObject root)
                                     {
-    // set_json_id(root, obj, "climate-" + obj->get_object_id(), start_config);
+    // set_json_id(root, obj, "climate-" + get_object_id(obj), start_config);
     // const auto traits = obj->get_traits();
     // int8_t target_accuracy = traits.get_target_temperature_accuracy_decimals();
     // int8_t current_accuracy = traits.get_current_temperature_accuracy_decimals();
@@ -2350,7 +2423,7 @@ namespace esphome
     //   if (!has_state)
     //     root["state"] = root["target_temperature"];
     // } });
-     set_json_id(root, obj, "climate-" + obj->get_object_id(), start_config);
+     set_json_id(root, obj, "climate-" + get_object_id(obj), start_config);
     const auto traits = obj->get_traits();
     int8_t target_accuracy = traits.get_target_temperature_accuracy_decimals();
     int8_t current_accuracy = traits.get_current_temperature_accuracy_decimals();
@@ -2386,12 +2459,7 @@ namespace esphome
         for (auto const &custom_preset : traits.get_supported_custom_presets())
           opt.add(custom_preset);
       }
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     }
 
     bool has_state = false;
@@ -2444,6 +2512,8 @@ namespace esphome
 #ifdef USE_LOCK
         void WebServer::on_lock_update(lock::Lock *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->lock_json(obj, obj->state, DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->lock_json(obj, obj->state, DETAIL_STATE).c_str());
         }
@@ -2451,17 +2521,10 @@ namespace esphome
         {
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
-                                //  set_json_icon_state_value(root, obj, "lock-" + obj->get_object_id(), lock::lock_state_to_string(value), value,
-                                //                           start_config); });
-                                    set_json_icon_state_value(root, obj, "lock-" + obj->get_object_id(), lock::lock_state_to_string(value), value,
+                                    set_json_icon_state_value(root, obj, "lock", lock::lock_state_to_string(value), value,
                               start_config);
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
         void WebServer::handle_lock_request(mg_connection *c, JsonObject doc)
@@ -2469,7 +2532,7 @@ namespace esphome
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (lock::Lock *obj : App.get_locks())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
 
                 // if (request->method() == HTTP_GET) {
@@ -2477,9 +2540,9 @@ namespace esphome
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -2489,19 +2552,19 @@ namespace esphome
                     // mg_http_reply(c, 200, "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", data.c_str());
                     ws_reply(c, data.c_str(), true);
                 }
-                else if (doc["action"] == "lock")
+                else if (doc[FC("action")] == "lock")
                 {
                     this->schedule_([obj]()
                                     { obj->lock(); });
                     ws_reply(c, "", true);
                 }
-                else if (doc["action"] == "unlock")
+                else if (doc[FC("action")] == "unlock")
                 {
                     this->schedule_([obj]()
                                     { obj->unlock(); });
                     ws_reply(c, "", true);
                 }
-                else if (doc["action"] == "open")
+                else if (doc[FC("action")] == "open")
                 {
                     this->schedule_([obj]()
                                     { obj->open(); });
@@ -2521,6 +2584,8 @@ namespace esphome
 #ifdef USE_ALARM_CONTROL_PANEL
         void WebServer::on_alarm_control_panel_update(alarm_control_panel::AlarmControlPanel *obj)
         {
+            if (!this->include_internal_ && obj->is_internal())
+                 return;
             // this->events_.send(this->alarm_control_panel_json(obj, obj->get_state(), DETAIL_STATE).c_str(), "state");
             this->push(STATE, this->alarm_control_panel_json(obj, obj->get_state(), DETAIL_STATE).c_str());
         }
@@ -2531,19 +2596,11 @@ namespace esphome
             return json::build_json([this, obj, value, start_config](JsonObject root)
                                     {
 
-    //  char buf[16];
-    // set_json_icon_state_value(root, obj, "alarm-control-panel-" + obj->get_object_id(),
-    //                           PSTR_LOCAL(alarm_control_panel_state_to_string(value)), value, start_config); });
+
         char buf[16];
-    set_json_icon_state_value(root, obj, "alarm-control-panel-" + obj->get_object_id(),
-                              PSTR_LOCAL(alarm_control_panel_state_to_string(value)), value, start_config);
+    set_json_icon_state_value(root, obj, "alarm-control-panel",PSTR_LOCAL(alarm_control_panel_state_to_string(value)), value, start_config);
     if (start_config == DETAIL_ALL) {
-      if (this->sorting_entitys_.find(obj) != this->sorting_entitys_.end()) {
-        root["sorting_weight"] = this->sorting_entitys_[obj].weight;
-        if (this->sorting_groups_.find(this->sorting_entitys_[obj].group_id) != this->sorting_groups_.end()) {
-          root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[obj].group_id].name;
-        }
-      }
+    this->add_sorting_info_(root, obj);
     } });
         }
         void WebServer::handle_alarm_control_panel_request(mg_connection *c, JsonObject doc)
@@ -2551,14 +2608,14 @@ namespace esphome
             // struct mg_http_message *hm = (struct mg_http_message *) ev_data;
             for (alarm_control_panel::AlarmControlPanel *obj : App.get_alarm_control_panels())
             {
-                if (obj->get_object_id() != doc["oid"])
+                if (get_object_id(obj) != doc[FC("oid")])
                     continue;
                 if (doc["method"] == "GET")
                 {
                     auto detail = DETAIL_STATE;
-                    if (doc.containsKey("detail"))
+                    if (doc[FC("detail")].is<JsonVariant>())
                     {
-                        if (doc["detail"] == "all")
+                        if (doc[FC("detail")] == "all")
                         {
                             detail = DETAIL_ALL;
                         }
@@ -2574,8 +2631,9 @@ namespace esphome
 
         void WebServer::push(msgType mt, const char *data, uint32_t id, uint32_t reconnect)
         {
-            struct mg_connection *c;
-            std::string type;
+
+         //  const char * old = data;
+           const char * type;
             switch (mt)
             {
             case PING:
@@ -2597,44 +2655,55 @@ namespace esphome
                 return;
             }
 
+
+#ifdef USE_WEBKEYPAD_ENCRYPTION
             std::string newdata;
+            if (credentials_.crypt && strlen(data) > 0) {
+                newdata=std::string(data);
+                encrypt(newdata);
+                data=newdata.c_str();
+            }
+#endif
 
-            if (credentials_.crypt && strlen(data) > 0)
-                newdata = encrypt(data);
-            else
-                newdata = std::string(data);
-
-            for (c = mgr.conns; c != NULL; c = c->next)
+            for (  struct mg_connection *c = mgr.conns; c != NULL; c = c->next)
             {
-
-                if (credentials_.crypt && !c->data[1])
+               // printf("id %d recv size=%d, send size=%d\n",(int)c->id,c->recv.size,c->send.size);
+#ifdef USE_WEBKEYPAD_ENCRYPTION
+                if (credentials_.crypt && !c->is_authenticated)
                     continue; // not authenticated with encrypted response
+#endif
 
-                if (c->data[0] == 'E')
+                if (c->is_event && !c->is_closing)
                 {
+                   // printf("writing id:%d, size:%d, data: %s\n",c->id,c->send.len,old);
                     // ESP_LOGD(TAG,"type=%s,len=%d,data=%s",type.c_str(),strlen(data),data);
                     if (id && reconnect)
-                        mg_printf(c, PSTR("id: %d\r\nretry: %d\r\nevent: %s\r\ndata: %s\r\n\r\n"), id, reconnect, type.c_str(), newdata.c_str());
+                        mg_printf(c, FC("id: %d\r\nretry: %d\r\nevent: %s\r\ndata: %s\r\n\r\n"), id, reconnect, type, data);
                     else
-                        mg_printf(c, PSTR("event: %s\r\ndata: %s\r\n\r\n"), type.c_str(), newdata.c_str());
+                        mg_printf(c, FC("event: %s\r\ndata: %s\r\n\r\n"), type, data);
 
-                    if (c->send.len > 15000)
+                    if (c->send.len > 10000) {
+                        ESP_LOGD(TAG,"Non responsive event connection. Closing %d",c->id);
                         c->is_closing = 1; // dead connection. kill it.
+                    }
                     continue;
                 }
-
-                if (c->data[0] != 'W')
+#ifdef USE_WEBKEYPAD_WEBSOCKET
+                if (!c->is_websocket)
                     continue;
 
                 if (mt == PING)
-                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":\"%d\"}"), "type", type.c_str(), "data", id);
+                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":\"%d\"}"), "type", type, "data", id);
                 else if ((mt == LOG || mt == OTA) && !credentials_.crypt)
-                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":\"%s\"}"), "type", type.c_str(), "data", newdata.c_str());
+                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":\"%s\"}"), "type", type, "data", data);
                 else
-                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%s}"), "type", type.c_str(), "data", newdata.c_str());
+                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":%s}"), "type", type, "data", data);
 
-                if (c->send.len > 15000)
+                if (c->send.len > 10000)
                     c->is_closing = 1; // dead connection. kill it.
+#endif
+
+
             }
         }
 
@@ -2690,7 +2759,7 @@ namespace esphome
             mg_random(nonce, sizeof(nonce));
 
             mg_printf(c,
-                      PSTR("HTTP/1.1 401 Unauthorized\r\n"
+                      FC("HTTP/1.1 401 Unauthorized\r\n"
                            "WWW-Authenticate: Digest qop=\"auth\", "
                            "realm=\"%s\", nonce=\"%lu\"\r\n"
                            "Content-Length: 0\r\n\r\n"),
@@ -2715,14 +2784,13 @@ namespace esphome
          * Returns 1 if authenticated, 0 otherwise.
          */
         static int mg_http_check_digest_auth(struct mg_http_message *hm,
-                                             const char *auth_domain, Credentials *creds)
+                                             const char *auth_domain, Credentials creds)
         {
             mg_str *hdr;
             char expected_response[33];
             mg_str username, cnonce, response, uri, qop, nc, nonce;
             /* Parse "Authorization:" header, fail fast on parse error */
-            if (hm == NULL || creds == NULL ||
-                (hdr = mg_http_get_header(hm, "Authorization")) == 0 ||
+            if (hm == NULL || (hdr = mg_http_get_header(hm, "Authorization")) == 0 ||
 
                 (username = mg_http_get_header_var(*hdr, mg_str_n("username", 8))).len == 0 ||
                 (cnonce = mg_http_get_header_var(*hdr, mg_str_n("cnonce", 6))).len == 0 ||
@@ -2738,18 +2806,22 @@ namespace esphome
             {
                 return 0;
             }
-
+            // if (hdr != NULL) {
+            //         std::string s=std::string(hdr->buf,hdr->len);
+            //         Serial.printf("HDR2 is %s\n",s.c_str());
+            //         }
             mg_str realm = mg_str(auth_domain);
             std::string u = std::string(username.buf, username.len);
             std::string r = std::string(response.buf, response.len);
             // if (strcmp(creds->username.c_str(),u.c_str())) {
             // MG_INFO(("password=%s",creds->password.c_str()));
+
             mg_mkmd5resp(
                 hm->method.buf, hm->method.len, hm->uri.buf,
                 hm->uri.len,
-                &username, creds->password.c_str(), &realm, &nonce, &nc, &cnonce,
+                &username, creds.password, &realm, &nonce, &nc, &cnonce,
                 &qop, expected_response);
-            // MG_INFO(("response =%s, expected=%s, cusername=%s,u=%s",r.c_str(),expected_response,creds->username.c_str(),u.c_str()));
+            //Serial.printf("response =%s, expected=%s, cusername=%s,u=%s\n",r.c_str(),expected_response,creds->username.c_str(),u.c_str());
             return mg_casecmp(r.c_str(), expected_response) == 0;
             // }
 
@@ -2757,42 +2829,50 @@ namespace esphome
             return 0;
         }
 
-        const std::string WebServer::encrypt(const char *message)
+#ifdef USE_WEBKEYPAD_ENCRYPTION
+
+
+        void WebServer::encrypt(std::string &data)
         {
-            int i = strlen(message);
-            // ESP_LOGD(TAG,"len=%d",i);
-            if (!i)
-                return "";
-            int buf = round(i / 16) * 16;
-            int length = (buf <= i) ? buf + 16 : buf;
-            uint8_t encrypted[length];
-            uint8_t iv[16];
-            random_bytes(iv, 16);
-
-            std::string eiv = base64_encode(iv, 16);
-
+            const char * message=data.c_str();
+            int ml = data.length();
+            if (!ml)
+                return ;
+   
+            uint8_t iv[AES_IV_SIZE +1];
+            random_bytes(iv, AES_IV_SIZE );
+            std::string eiv = base64_encode(iv, AES_IV_SIZE ); 
             AES aes(credentials_.token, iv, AES::AES_MODE_256, AES::CIPHER_ENCRYPT);
-            aes.process((uint8_t *)message, &encrypted[0], i);
+           int length = aes.calcSizeAndPad(ml);
+           // std::string em="";
 
-            std::string em = base64_encode(&encrypted[0], length);
 
-            SHA256HMAC hmac(credentials_.hmackey, 32);
+        //  //   if (length < 1024) {
+        //         uint8_t encrypted[length]; //use stack for small messages
+        //         aes.padPlaintext((uint8_t *)message, encrypted);
+        //         aes.processNoPad((uint8_t *)encrypted, encrypted, length);
+        //         em = base64_encode(encrypted, length);
+
+        //     } else {
+                auto encrypted = std::unique_ptr<uint8_t[]>(new uint8_t[length]);
+                aes.padPlaintext((uint8_t*) message, encrypted.get());
+                aes.processNoPad(encrypted.get(), encrypted.get(), length);
+               std::string em = base64_encode(encrypted.get(), length);
+           // }
+            
+            SHA256HMAC hmac((const char*) credentials_.hmackey, SHA256HMAC_SIZE);
             hmac.doUpdate(eiv.c_str(), eiv.length());
             hmac.doUpdate(em.c_str(), em.length());
-            uint8_t authCode[SHA256HMAC_SIZE];
-            hmac.doFinal(authCode);
+  
+            uint8_t authCode[SHA256HMAC_SIZE+1];
+            hmac.doFinal((char*)authCode);
 
-            // std::string ehm=base64_encode(authCode,SHA256HMAC_SIZE);
-
-            std::string enc = "{\"iv\":\"" + eiv + "\",\"data\":\"";
-            enc.append(em);
-            enc.append("\",\"hash\":\"" + base64_encode(authCode, SHA256HMAC_SIZE) + "\"}");
-            // ESP_LOGD(TAG,"message size=%d,length=%d,ensize=%d,output=%s",i,length,encrypted_size,enc.c_str());
-            // ESP_LOGD(TAG,"hmac=%s",ehm.c_str());
-            return enc;
+            data = "{\"iv\":\"" + eiv + "\",\"data\":\"" + em + "\",\"hash\":\"" + base64_encode(authCode, SHA256HMAC_SIZE) + "\"}";
+            //data.append(em);
+            //data.append("\",\"hash\":\"" + base64_encode(authCode, SHA256HMAC_SIZE) + "\"}");
         }
 
-        const std::string WebServer::decrypt(JsonObject doc, uint8_t *err)
+        bool WebServer::decrypt(JsonObject doc, uint8_t *err,std::string & out)
         {
             const char *iv = doc["iv"];
             const char *data = doc["data"];
@@ -2800,16 +2880,16 @@ namespace esphome
             unsigned long cid = 0;
 
             std::string token = "";
-            const char *seqstr = "";
+            const char * seqstr = "";
             int seq = 0;
             int *lastseq = NULL;
             // right now we don't force a seq/cid field in the encrypted packet.
-            if (doc.containsKey("seq"))
+            if (doc["seq"].is<JsonVariant>())
             {
                 seqstr = doc["seq"];
                 seq = (unsigned long)doc["seq"];
             }
-            if (doc.containsKey("cid"))
+            if (doc["cid"].is<JsonVariant>())
             {
                 // ensure packet is associated with an active session token and the sequence is newer to prevent replay attacks
                 cid = (unsigned long)doc["cid"];
@@ -2823,48 +2903,47 @@ namespace esphome
                         if (seq > 0 && seq <= *lastseq)
                         {
                             *err = 1;
-                            return "";
+                            return 0;
                         }
                     }
                     else
                     {
                         *err = 1;
-                        return "";
+                        return 0;
                     }
                 }
                 else
                 {
                     *err = 1;
-                    return "";
+                    return 0;
                 }
             }
 
             uint8_t *key = credentials_.token;
             uint8_t *hmackey = credentials_.hmackey;
-            uint8_t data_decoded[strlen(data)];
-            uint8_t iv_decoded[strlen(iv)];
+            uint8_t data_decoded[strlen(data)+1];
+            uint8_t iv_decoded[strlen(iv)+1];
 
-            SHA256HMAC hmac(credentials_.hmackey, 32);
+            SHA256HMAC hmac((const char*) credentials_.hmackey, SHA256HMAC_SIZE);
             hmac.doUpdate(iv, strlen(iv));
             if (token != "")
             {
                 hmac.doUpdate(token.c_str(), token.length());
             }
-            if (seqstr != "")
+            if (strlen(seqstr) > 0)
             {
                 hmac.doUpdate(seqstr, strlen(seqstr));
             }
 
             hmac.doUpdate(data, strlen(data));
             uint8_t authCode[SHA256HMAC_SIZE];
-            hmac.doFinal(authCode);
-
-            std::string ehm = base64_encode(authCode, SHA256HMAC_SIZE);
+            hmac.doFinal((char*)authCode);
+             std::string ehm = base64_encode(authCode, SHA256HMAC_SIZE);
             if (ehm != hash)
             {
                 ESP_LOGD(TAG, "ehm [%s] does not match hash [%s]", ehm.c_str(), hash.c_str());
                 *err = 1;
-                return "";
+                return 0;
             }
             if (seq > 0 && lastseq != NULL)
                 *lastseq = seq;
@@ -2873,107 +2952,124 @@ namespace esphome
             base64_decode(std::string(iv), iv_decoded, strlen(iv));
             AES aes(key, iv_decoded, AES::AES_MODE_256, AES::CIPHER_DECRYPT);
             aes.process((uint8_t *)data_decoded, data_decoded, encrypted_length);
-            std::string out = std::string((char *)data_decoded);
-            // ESP_LOGD(TAG,"decryption: %s,%s,len=%d\r\nhash=%s",data,iv,strlen(iv),ehm.c_str());
+            out = std::string((char *)data_decoded);
+             //ESP_LOGD(TAG,"decryption: %s,%s,len=%d\r\nhash=%s, data=%s",data,iv,strlen(iv),ehm.c_str(),out.c_str());
             // return std::string((char*)data_decoded);
-            return out;
+            return 1;
         }
+#endif
 
-        static void handle_uploads(struct mg_connection *c, int ev, void *ev_data)
+#ifdef USE_WEBKEYPAD_OTA
+        void WebServer::handle_uploads(struct mg_connection *c, int ev, void *ev_data)
         {
-            struct upload_state *us = (struct upload_state *)c->data;
-            WebServer *srv = static_cast<WebServer *>(webServerPtr);
+
             // Catch /update requests early, without buffering whole body
             // When we receive MG_EV_HTTP_HDRS event, that means we've received all
             // HTTP headers but not necessarily full HTTP body
-            if (ev == MG_EV_HTTP_HDRS)
+            if (!c->is_ota && ev == MG_EV_HTTP_HDRS)
             {
                 struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-                if (mg_match(hm->uri, mg_str("/update/*"), NULL))
+                if (hm == nullptr) return;
+                if (mg_match(hm->uri, mg_str("/update*"), NULL))
                 {
 
-                    if (srv->get_credentials()->password != "")
+                    if (strcmp(credentials_.password,"") != 0 )
                     {
-                        if (!mg_http_check_digest_auth(hm, "webkeypad", srv->get_credentials()))
+                        if (!mg_http_check_digest_auth(hm, "webkeypad", credentials_))
                         {
                             mg_send_digest_auth_request(c, "webkeypad");
-                            c->is_draining = 1;
                             c->recv.len = 0;
+                            c->is_resp=0;
                             return;
                         }
                     }
+                    c->is_ota=true;
 
-                    char path[100];
-                    mg_snprintf(path, sizeof(path), "%.*s", hm->uri.len - 8,
-                                hm->uri.buf + 8);
-                    MG_INFO(("Performing OTA update..."));
-                    us->fn = path;
-                    us->expected = hm->body.len;             // Store number of bytes we expect
+                    struct mg_str *fs = mg_http_get_header(hm, "x-filesize");
+                    struct mg_str *fn = mg_http_get_header(hm, "x-filename");
+                    if (fn != nullptr)
+                        upl.filename=PlatformString(std::string(fn->buf,fn->len).c_str());
+                    if (fs != nullptr)
+                        upl.filesize=std::stoi(std::string(fs->buf,fs->len));
+                    if (upl.filesize)
+                        upl.expected = upl.filesize;             // Store number of bytes we expect
+                    else
+                        upl.expected = hm->body.len;             // Store number of bytes we expect
+                   
+
+                    upl.received=0;
                     mg_iobuf_del(&c->recv, 0, hm->head.len); // Delete HTTP headers
                     c->pfn = NULL;                           // Silence HTTP protocol handler, we'll use MG_EV_READ
+                    ESP_LOGI(TAG,"Performing OTA update... file: %s, size: %d,expected: %d",upl.filename.c_str(),upl.filesize,upl.expected);
+                   
                 }
-            }
+             }
+
+
+            if (!c->is_ota) return;  //not an ota update so return
+
             // Catch uploaded file data for both MG_EV_READ and MG_EV_HTTP_HDRS
-            if (us->expected > 0 && c->recv.len > 0)
+            if (upl.filesize > 0 && c->recv.len > 0)
             {
-                // MG_INFO(("Expected bytes: %d, got: %d, received: %d",us->expected,c->recv.len,us->received));
-                if ((us->received + c->recv.len) >= us->expected)
+                // MG_INFO(("Expected bytes: %d, got: %d, received: %d",upl.expected,c->recv.len,upl.received));
+                if ((upl.received + c->recv.len) >= upl.expected)
                 {
                     // Uploaded everything. Send response back
-                    MG_INFO(("OTA uploaded %lu bytes from file %s", us->received + c->recv.len, us->fn.c_str()));
-                    mg_http_reply(c, 200, NULL, "%lu ok\n", us->received);
-                    srv->handleUpload(us->expected, us->fn, us->received, c->recv.buf, c->recv.len, true);
-                    memset(us, 0, sizeof(*us)); // Cleanup upload state
-                    c->is_draining = 1;         // Close connection when response gets sent
+                    ESP_LOGI(TAG,"OTA uploaded %lu bytes from file %s", upl.received + c->recv.len, ota_filename_.c_str());
+                    mg_http_reply(c, 200, NULL, "%lu ok\n", upl.received);
+                    handleUpload(upl.expected,( PlatformString) upl.filename, upl.received, c->recv.buf, c->recv.len, true);
+                   // memset(us, 0, sizeof(*us)); // Cleanup upload state
+                   upl.expected=0;
+                   c->is_ota=false;
                 }
-                else
-                {
-                    srv->handleUpload(us->expected, us->fn, us->received, c->recv.buf, c->recv.len, false);
-                    us->received += c->recv.len;
-                }
-
+                
+                handleUpload(upl.expected,(PlatformString)upl.filename, upl.received, c->recv.buf, c->recv.len, false);
+                upl.received += c->recv.len;
                 c->recv.len = 0; // Delete received data
             }
         }
+#endif
 
-        void WebServer::ev_handler(struct mg_connection *c, int ev, void *ev_data)
+      void WebServer::ev_handler(struct mg_connection *c, int ev, void *ev_data)
         {
-            WebServer *srv = static_cast<WebServer *>(webServerPtr);
-            handle_uploads(c, ev, ev_data);
-
-            bool final = false;
-            if (ev == MG_EV_WRITE)
-            {
-                if (c->send.len == 0 && c->send.size > 1024)
-                {
-                    void *p = calloc(1, 1024);
-                    if (p != NULL)
-                    {
-                        size_t *len = (size_t *)ev_data;
-                        // keep outbound queue size under 1k to minimize ram use.
-                        // ESP_LOGD(TAG,"Send size=%d, len=%d, write size=%d, type=%02x",c->send.size,c->send.len,*len,c->data[0]);
-                        memset(c->send.buf, 0, c->send.size);
-                        free(c->send.buf);
-                        c->send.buf = (unsigned char *)p;
-                        c->send.size = 1024;
-                    }
+            #ifdef USE_WEBKEYPAD_OTA
+            if (!c->is_sending) handle_uploads(c, ev, ev_data);
+            #endif
+            if (ev == MG_EV_POLL) {
+                if (c->is_sending ) {
+                    //printf("Sending js data to connection %d\n",c->id);
+                    send_js_include(c); // process pending file send
                 }
-            }
+                if (c->recv.len == 0 && c->recv.size > MG_IO_SIZE && !c->is_ota && c->is_accepted) {
+                   // printf("Resized recv buf for id:%d size: %d\n",(int)c->id,c->recv.size);
+                   if (c->is_event || c->is_websocket)
+                    mg_iobuf_resize(&c->recv,0);
+                   else
+                    mg_iobuf_resize(&c->recv,MG_IO_SIZE); //keep receive buffer low as we don't get much data in and saves ram
+                }
+                if (c->send.len == 0 && c->send.size  > MG_IO_SIZE && c->is_accepted)
+                {
+                   //printf("Resized send buf for id:%d size: %d\n",(int)c->id,c->send.size);
+                   if (c->is_event || c->is_websocket)
+                    mg_iobuf_resize(&c->send,MG_IO_SIZE);
+                   else
+                    mg_iobuf_resize(&c->send,0);
+                }
+             }  
             else if (ev == MG_EV_CLOSE)
             {
                 ESP_LOGD(TAG, "Connection %d closed", c->id);
-                srv->tokens_.erase(c->id);
+                tokens_.erase(c->id);
 
 #if defined(ESP32)
                 ESP_LOGD(TAG, "Current Heap values: freeheap: %5d,minheap: %5d,maxfree:%5d\n", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
 #endif
-                // srv->sessionTokens.erase(c);
             }
             else if (ev == MG_EV_ACCEPT)
             {
                 /*
-                const char *cert=srv->get_certificate();
-                const char *key=srv->get_certificate_key();
+                const char *cert=get_certificate();
+                const char *key=get_certificate_key();
                 MG_INFO(("certificate len=%d,%s,%s",strlen(cert),cert,key));
 
                 if (strlen(cert)==0) return;
@@ -2984,136 +3080,183 @@ namespace esphome
 
                 mg_tls_init(c, &opts);
             */
+                c->is_authenticated=0; // ensure we set these to  default
+                c->is_sending=0;
+                c->is_ota=0;
+                c->is_event=0;
                 ESP_LOGD(TAG, "New connection %d accepted", c->id);
 #if defined(ESP32)
                 ESP_LOGD(TAG, "Current Heap values: freeheap: %5d,minheap: %5d,maxfree:%5d\n", esp_get_free_heap_size(), esp_get_minimum_free_heap_size(), heap_caps_get_largest_free_block(8));
 #endif
             }
+
+#ifdef USE_WEBKEYPAD_WEBSOCKET
             else if (ev == MG_EV_WS_MSG)
             {
                 // Got websocket frame. Received data is wm->data. Echo it back!
                 struct mg_ws_message *wm = (struct mg_ws_message *)ev_data;
-                DynamicJsonDocument doc(wm->data.len * 1.5);
+
+                JsonDocument doc=json::parse_json((const uint8_t*) wm->data.buf,wm->data.len);
                 JsonObject obj = doc.as<JsonObject>();
-                std::string buf = std::string(wm->data.buf, wm->data.len);
-                deserializeJson(doc, buf.c_str());
                 uint8_t err = 0;
-
-                if (doc.containsKey("iv") && srv->get_credentials()->crypt)
+#ifdef USE_WEBKEYPAD_ENCRYPTION
+                if (obj["iv"].is<JsonVariant>() && credentials_.crypt)
                 {
-
-                    buf = srv->decrypt(obj, &err);
+                    std::string buf="";
+                    decrypt(obj, &err,buf);
+                   
                     if (buf == "" || err)
                         err = 1;
                     if (!err)
-                        deserializeJson(doc, buf.c_str());
+                        doc=json::parse_json((const uint8_t *)buf.c_str(), buf.length());
+                       // deserializeJson(doc, buf.c_str());
                 }
+#endif
                 if (!err)
                 {
-                    srv->handleRequest(c, obj);
+                    handleRequest(c, obj);
                 }
                 else
                     mg_http_reply(c, 403, "", "");
-            }
-            if (ev == MG_EV_HTTP_MSG && c->data[0] != 'U')
+
+            } else
+#endif //websocket
+            if (ev == MG_EV_HTTP_MSG && !c->is_ota)
             {
                 struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-
-                if (srv->get_credentials()->password != "" && !srv->get_credentials()->crypt)
+               // std::string u=std::string(hm->uri.buf, hm->uri.len);
+                if (strcmp(credentials_.password,"") != 0 && !credentials_.crypt)
                 {
-                    if (!mg_http_check_digest_auth(hm, "webkeypad", srv->get_credentials()))
+                    if (!mg_http_check_digest_auth(hm, FC("webkeypad"), credentials_))
                     {
-                        mg_send_digest_auth_request(c, "webkeypad");
-                        c->is_draining = 1;
+                        mg_send_digest_auth_request(c, FC("webkeypad"));
                         c->recv.len = 0;
+                        c->is_resp=0;
                         return;
                     }
                 }
 
-                if (mg_match(hm->uri, mg_str("/ws"), NULL) && c->data[0] != 'E')
+
+#ifdef USE_WEBKEYPAD_WEBSOCKET
+                if (mg_match(hm->uri, mg_str("/ws"), NULL) && !c->is_event)
                 {
 
                     // Upgrade to websocket. From now on, a connection is a full-duplex
                     // Websocket connection, which will receive MG_EV_WS_MSG events.
                     mg_ws_upgrade(c, hm, NULL);
-                    c->data[0] = 'W';
-                    c->send.c = c;
+                    c->is_websocket=1;
                     std::string enc;
-                    bool crypt = srv->get_credentials()->crypt;
-                    enc = srv->get_config_json(c->id);
+                    bool crypt = credentials_.crypt;
+                    get_config_json(c->id,enc);
+                    #ifdef USE_WEBKEYPAD_ENCRYPTION
                     if (crypt)
-                        enc = srv->encrypt(enc.c_str());
-                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%ul,\"%s\":%s}"), "type", "app_config", "data", enc.c_str());
-                    if (strlen(srv->get_keypad_config()) > 0)
+                        encrypt(enc);
+                    #endif
+                    mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":%ul,\"%s\":%s}"), "type", "app_config", "data", enc.c_str());
+                    get_keypad_config(enc);
+                    if (enc.length() > 0)
                     {
-                        enc = srv->get_keypad_config();
+                       #ifdef USE_WEBKEYPAD_ENCRYPTION
                         if (crypt)
-                            enc = srv->encrypt(enc.c_str());
-                        mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%s}"), "type", "key_config", "data", enc.c_str());
+                            encrypt(enc);
+                        #endif
+                        mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":%s}"), "type", "key_config", "data", enc.c_str());
                     }
-                    for (auto &group : srv->sorting_groups_)
+                    for (auto &group : sorting_groups_)
                     {
-                        enc = json::build_json([group](JsonObject root)
-                                               {
+
+                    json::JsonBuilder builder;
+                    JsonObject root = builder.root(); 
+
                    root["name"] = group.second.name;
-                   root["sorting_weight"] = group.second.weight; });
-                        if (crypt)
-                            enc = srv->encrypt(enc.c_str());
-                        mg_ws_printf(c, WEBSOCKET_OP_TEXT, PSTR("{\"%s\":\"%s\",\"%s\":%s}"), "type", "sorting_group", "data", enc.c_str());
-                    }
+                   root["sorting_weight"] = group.second.weight; 
+                   enc=builder.serialize();
 
-                    srv->entities_iterator_.begin(srv->include_internal_);
-                }
-                else if (mg_match(hm->uri, mg_str("/events"), NULL) && !c->is_websocket)
+                   #ifdef USE_WEBKEYPAD_ENCRYPTION
+                        if (crypt)
+                            encrypt(enc);
+                    #endif
+                        mg_ws_printf(c, WEBSOCKET_OP_TEXT, FC("{\"%s\":\"%s\",\"%s\":%s}"), "type", "sorting_group", "data", enc.c_str());
+                    }
+                      if (!crypt)
+                            entities_iterator_.begin(this->include_internal_);
+                      c->pfn = NULL; 
+                      return;
+                   
+                } else
+#endif //websocket
+                if (mg_match(hm->uri, mg_str("/events"), NULL) && !c->is_websocket)
                 {
-                    mg_str *hdr = mg_http_get_header(hm, "Accept");
+                  //  mg_str *hdr = mg_http_get_header(hm, "Accept");
                     // if (hdr != NULL && mg_strstr(*hdr, mg_str("text/event-stream")) != NULL)  {
-                    c->data[0] = 'E';
-                    mg_printf(c, PSTR("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"));
+                    c->is_event=1;
+                    mg_printf(c, FC("HTTP/2 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"));
                     c->send.c = c;
+                    bool crypt = credentials_.crypt;
                     std::string enc;
-                    bool crypt = srv->get_credentials()->crypt;
-                    enc = srv->get_config_json(c->id);
+                    get_config_json(c->id,enc);
+                    #ifdef USE_WEBKEYPAD_ENCRYPTION
                     if (crypt)
-                        enc = srv->encrypt(enc.c_str());
-                    mg_printf(c, PSTR("id: %d\r\nretry: %d\r\nevent: %s\r\ndata: %s\r\n\r\n"), millis(), 30000, "ping", enc.c_str());
-
-                    for (auto &group : srv->sorting_groups_)
+                        encrypt(enc);
+                    #endif
+                    mg_printf(c, FC("id: %d\r\nretry: %d\r\nevent: %s\r\ndata: %s\r\n\r\n"), millis(), 30000, "ping", enc.c_str());
+    //                                printf(FC("id: %d\r\nretry: %d\r\nevent: %s\r\ndata: %s\n"), millis(), 30000, "ping", enc.c_str());
+                    for (auto &group : sorting_groups_)
                     {
-                        enc = json::build_json([group](JsonObject root)
-                                               {
-                     root["name"] = group.second.name;
-                     root["sorting_weight"] = group.second.weight; });
-                        if (crypt)
-                            enc = srv->encrypt(enc.c_str());
-                        mg_printf(c, PSTR("event: %s\r\ndata: %s\r\n\r\n"), "sorting_group", enc.c_str());
+                      json::JsonBuilder builder;
+                      JsonObject root = builder.root(); 
+                       root["name"] = group.second.name;
+                       root["sorting_weight"] = group.second.weight;
+                       enc=builder.serialize();
+                        #if defined(USE_WEBKEYPAD_ENCRYPTION) && !defined(USE_ESP8266)
+                         if (crypt) 
+                             encrypt(enc);
+                        #endif
+                        mg_printf(c, FC("event: %s\r\ndata: %s\r\n\r\n"), "sorting_group", enc.c_str());
                     }
-
-                    if (strlen(srv->get_keypad_config()) > 0)
+                    mg_mgr_poll(&mgr,0);
+                    get_keypad_config(enc);
+                    if (enc.length() > 0)
                     {
-                        enc = srv->get_keypad_config();
-                        if (crypt)
-                            enc = srv->encrypt(enc.c_str());
-                        mg_printf(c, PSTR("event: %s\r\ndata: %s\r\n\r\n"), "key_config", enc.c_str());
+                        #if defined(USE_WEBKEYPAD_ENCRYPTION) && !defined(USE_ESP8266)
+                          if (crypt)  
+                             encrypt(enc);
+                        #endif
+                        mg_printf(c, FC("event: %s\r\ndata: %s\r\n\r\n"), "key_config", enc.c_str());
                     }
-                    srv->entities_iterator_.begin(srv->include_internal_);
-                    // } else
-                    //   mg_http_reply(c, 404,"", "");
+                       if (!crypt) //if we don't need encryption or authentication, we can start the iterator
+                        entities_iterator_.begin(this->include_internal_);
+                    c->pfn = NULL; 
+                    return;
                 }
-                else
+                 else
                 {
-                    if (!mg_match(hm->uri, mg_str("/update/*"), NULL))
+                    if (!mg_match(hm->uri, mg_str("/update*"), NULL))
                     {
                         c->send.c = c;
-                        srv->handleWebRequest(c, hm);
+                        c->recv.c = c;
+                        handleWebRequest(c, hm);
+
                     }
                 }
+
+
+            } else if (ev == MG_EV_OPEN) {
+
+                ESP_LOGD(TAG,"New connection open with client id %d\n",c->id);
+            } else if (ev == MG_EV_READ){
+                // ESP_LOGD(TAG,"reading from client %d,%d\n",c->fd,c->id);
             }
             else if (ev == MG_EV_ERROR)
             {
                 ESP_LOGE(TAG, "MG_EV_ERROR %lu %ld %s.", c->id, c->fd, (char *)ev_data);
+
             }
+           
+           
         }
+
+
 
         void WebServer::handleWebRequest(struct mg_connection *c, mg_http_message *hm)
         {
@@ -3121,7 +3264,6 @@ namespace esphome
             if (mg_match(hm->uri, mg_str("/"), NULL))
             {
                 this->handle_index_request(c);
-                c->is_draining = 1;
                 return;
             }
 
@@ -3129,7 +3271,6 @@ namespace esphome
             if (mg_match(hm->uri, mg_str("/0.css"), NULL))
             {
                 this->handle_css_request(c);
-                c->is_draining = 1;
                 return;
             }
 #endif
@@ -3138,7 +3279,6 @@ namespace esphome
             if (mg_match(hm->uri, mg_str("/0.js"), NULL))
             {
                 this->handle_js_request(c);
-                c->is_draining = 1; // uses about 22k or more of ram and doesnt free it so close it when done sending
                 return;
             }
 #endif
@@ -3148,51 +3288,58 @@ namespace esphome
             //  this->handle_pna_cors_request(c);
             //  return;
             //}
-
+             const char* const HEADER_CORS_REQ_PNA = FCS("Access-Control-Request-Private-Network");
             mg_str *hdr = mg_http_get_header(hm, HEADER_CORS_REQ_PNA);
             if (mg_vcasecmp(&hm->method, "OPTIONS") == 0 && hdr != NULL)
             {
                 this->handle_pna_cors_request(c);
-                c->is_draining = 1;
                 return;
             }
 
 #endif
-            DynamicJsonDocument doc(hm->message.len * 1.5);
+
+            JsonDocument doc;
             JsonObject obj = doc.to<JsonObject>();
             if (mg_match(hm->uri, mg_str("/api"), NULL))
             {
-
-                std::string buf = std::string(hm->body.buf, hm->body.len);
-                DeserializationError err = deserializeJson(doc, buf.c_str());
-                if (!err && doc.containsKey("iv") && credentials_.password != "")
+                doc=json::parse_json((const uint8_t *)hm->body.buf, hm->body.len);
+   #ifdef USE_WEBKEYPAD_ENCRYPTION
+                if (obj["iv"].is<JsonVariant>() && strcmp(credentials_.password,"") != 0)
                 {
                     uint8_t e = 0;
-                    buf = decrypt(obj, &e);
-                    if (buf != "")
-                        deserializeJson(doc, buf.c_str());
-                    else
+                    std::string buf="";
+                    decrypt(obj, &e,buf);
+                    if (buf != "") {
+                         doc=json::parse_json((const uint8_t *)buf.c_str(), buf.length());
+                     }  
+                     else
                         mg_http_reply(c, 403, "", "");
                 }
+#endif
             }
 
-            if (!doc.containsKey("domain"))
+            else 
             {
                 parseUrl(hm, obj);
             }
 
             handleRequest(c, obj);
+            //c->is_draining=1;
 
-           if (c->send.size > 1500 || c->recv.size > 1500)
-               c->is_draining = 1; // if send or recv queue getting too large close the connection to free up ram
+
         }
 
         void WebServer::handleRequest(mg_connection *c, JsonObject doc)
         {
-            std::string d = doc["domain"];
+         //   std::string d =doc[FC("domain")];
+          
+             if (doc[FC("domain")] == "wifisave") {
+                this->handle_wifisave(c,doc);
+                return;
+             }
 #ifdef USE_SENSOR
 
-            if (doc["domain"] == "sensor")
+            if (doc[FC("domain")] == "sensor")
             {
                 this->handle_sensor_request(c, doc);
                 return;
@@ -3200,7 +3347,7 @@ namespace esphome
 #endif
 
 #ifdef USE_SWITCH
-            if (doc["domain"] == "switch")
+            if (doc[FC("domain")] == "switch")
             {
                 this->handle_switch_request(c, doc);
                 return;
@@ -3208,7 +3355,7 @@ namespace esphome
 #endif
 
 #ifdef USE_BUTTON
-            if (doc["domain"] == "button")
+            if (doc[FC("domain")] == "button")
             {
                 this->handle_button_request(c, doc);
                 return;
@@ -3216,14 +3363,14 @@ namespace esphome
 #endif
 
 #ifdef USE_BINARY_SENSOR
-            if (doc["domain"] == "binary_sensor")
+            if (doc[FC("domain")] == "binary_sensor")
             {
                 this->handle_binary_sensor_request(c, doc);
                 return;
             }
 #endif
 #ifdef USE_FAN
-            if (doc["domain"] == "fan")
+            if (doc[FC("domain")] == "fan")
             {
                 this->handle_fan_request(c, doc);
                 return;
@@ -3231,7 +3378,7 @@ namespace esphome
 #endif
 
 #ifdef USE_LIGHT
-            if (doc["domain"] == "light")
+            if (doc[FC("domain")] == "light")
             {
                 this->handle_light_request(c, doc);
                 return;
@@ -3239,7 +3386,7 @@ namespace esphome
 #endif
 
 #ifdef USE_TEXT_SENSOR
-            if (doc["domain"] == "text_sensor")
+            if (doc[FC("domain")] == "text_sensor")
             {
                 this->handle_text_sensor_request(c, doc);
                 return;
@@ -3247,7 +3394,7 @@ namespace esphome
 #endif
 
 #ifdef USE_COVER
-            if (doc["domain"] == "cover")
+            if (doc[FC("domain")] == "cover")
             {
                 this->handle_cover_request(c, doc);
                 return;
@@ -3255,7 +3402,7 @@ namespace esphome
 #endif
 
 #ifdef USE_NUMBER
-            if (doc["domain"] == "number")
+            if (doc[FC("domain")] == "number")
             {
                 this->handle_number_request(c, doc);
                 return;
@@ -3263,7 +3410,7 @@ namespace esphome
 #endif
 
 #ifdef USE_DATETIME_DATE
-            if (doc["domain"] == "date")
+            if (doc[FC("domain")] == "date")
             {
                 this->handle_date_request(c, doc);
                 return;
@@ -3271,7 +3418,7 @@ namespace esphome
 #endif
 
 #ifdef USE_DATETIME_TIME
-            if (doc["domain"] == "time")
+            if (doc[FC("domain")] == "time")
             {
                 this->handle_time_request(c, doc);
                 return;
@@ -3279,7 +3426,7 @@ namespace esphome
 #endif
 
 #ifdef USE_DATETIME_DATETIME
-            if (doc["domain"] == "datetime")
+            if (doc[FC("domain")] == "datetime")
             {
                 this->handle_datetime_request(c, doc);
                 return;
@@ -3287,7 +3434,7 @@ namespace esphome
 #endif
 
 #ifdef USE_VALVE
-            if (doc["domain"] == "valve")
+            if (doc[FC("domain")] == "valve")
             {
                 this->handle_valve_request(c, doc);
                 return;
@@ -3295,7 +3442,7 @@ namespace esphome
 #endif
 
 #ifdef USE_UPDATE
-            if (doc["domain"] == "update")
+            if (doc[FC("domain")] == "update")
             {
                 this->handle_update_request(c, doc);
                 return;
@@ -3303,7 +3450,7 @@ namespace esphome
 #endif
 
 #ifdef USE_EVENT
-            if (doc["domain"] == "event")
+            if (doc[FC("domain")] == "event")
             {
                 this->handle_event_request(c, doc);
                 return;
@@ -3311,7 +3458,7 @@ namespace esphome
 #endif
 
 #ifdef USE_TEXT
-            if (doc["domain"] == "text")
+            if (doc[FC("domain")] == "text")
             {
                 this->handle_text_request(c, doc);
                 return;
@@ -3319,7 +3466,7 @@ namespace esphome
 #endif
 
 #ifdef USE_SELECT
-            if (doc["domain"] == "select")
+            if (doc[FC("domain")] == "select")
             {
                 this->handle_select_request(c, doc);
                 return;
@@ -3327,7 +3474,7 @@ namespace esphome
 #endif
 
 #ifdef USE_CLIMATE
-            if (doc["domain"] == "climate")
+            if (doc[FC("domain")] == "climate")
             {
                 this->handle_climate_request(c, doc);
                 return;
@@ -3335,7 +3482,7 @@ namespace esphome
 #endif
 
 #ifdef USE_LOCK
-            if (doc["domain"] == "lock")
+            if (doc[FC("domain")] == "lock")
             {
                 this->handle_lock_request(c, doc);
                 return;
@@ -3343,29 +3490,40 @@ namespace esphome
 #endif
 
 
-            if (doc["domain"] == "auth")
+            if (doc[FC("domain")] == "auth")
             {
                 this->handle_auth_request(c, doc);
                 return;
             }
-            if (doc["domain"] == "alarm_panel")
+            if (doc[FC("domain")] == "alarm_panel")
             {
-                this->handle_alarm_panel_request(c, doc);
+                  this->handle_alarm_panel_request(c, doc);
                 return;
             }
 
 
 #ifdef USE_ALARM_CONTROL_PANEL
-            if (doc["domain"] == "alarm_control_panel")
+            if (doc[FC("domain")] == "alarm_control_panel")
             {
                 this->handle_alarm_control_panel_request(c, doc);
                 return;
             }
 #endif
-
             // mg_http_reply(c,404,"","");
             ws_reply(c, "", false);
+
         }
+
+        void WebServer::add_sorting_info_(JsonObject &root, EntityBase *entity) {
+#ifdef USE_WEBSERVER_SORTING
+  if (this->sorting_entitys_.find(entity) != this->sorting_entitys_.end()) {
+    root["sorting_weight"] = this->sorting_entitys_[entity].weight;
+    if (this->sorting_groups_.find(this->sorting_entitys_[entity].group_id) != this->sorting_groups_.end()) {
+      root["sorting_group"] = this->sorting_groups_[this->sorting_entitys_[entity].group_id].name;
+    }
+  }
+#endif
+}
         void WebServer::add_entity_config(EntityBase *entity, float weight, uint64_t group)
         {
             this->sorting_entitys_[entity] = SortingComponents{weight, group};
@@ -3387,107 +3545,160 @@ namespace esphome
 #endif
         }
 
-        void WebServer::report_ota_error()
-        {
-#ifdef USE_ARDUINO
-            StreamString ss;
-            Update.printError(ss);
-            char buf[100];
-            ESP_LOGW(TAG, "OTA Update failed! Error: %s", ss.c_str());
-            snprintf(buf, 100, "OTA Update failed! Error: %s", ss.c_str());
-            std::string ebuf = escape_json(buf);
-            this->push(OTA, ebuf.c_str());
-            this->set_timeout(2000, []()
-                              { App.safe_reboot(); });
-#endif
-        }
-#if defined(ESP32)
-        bool WebServer::handleUpload(size_t bodylen, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
-        {
-            char buf[100];
-#ifdef USE_ARDUINO
-            bool success;
-            if (index == 0)
-            {
-                snprintf(buf, 100, "OTA Update Start: %s", filename.c_str());
+#ifdef USE_WEBKEYPAD_OTA
+
+  void WebServer::report_ota_progress_() {
+  const uint32_t now = millis();
+  if (now - this->last_ota_progress_ > 1000) {
+    float percentage = 0.0f;
+      char buf[100];
+     
+//    if (request->contentLength() != 0) {
+//      // Note: Using contentLength() for progress calculation is technically wrong as it includes
+//      // multipart headers/boundaries, but it's only off by a small amount and we don't have
+//      // access to the actual firmware size until the upload is complete. This is intentional
+//      // as it still gives the user a reasonable progress indication.
+//      percentage = (this->ota_read_length_ * 100.0f) / request->contentLength();
+//      ESP_LOGD(TAG, "OTA in progress: %0.1f%%", percentage);
+//    } else {
+
+      snprintf(buf,100,"OTA in progress: %" PRIu32 " bytes written of %d", this->ota_read_length_,upl.filesize);
+     #ifdef ESP8266
+      ESP_LOGD(TAG,"OTA in progress: %" PRIu32 " bytes written of %d", this->ota_read_length_,upl.filesize);
+     #else
+      ESP_LOGD(TAG,buf);
+      #endif
+      this->push(OTA,buf);
+//    }
+
+    this->last_ota_progress_ = now;
+  }
+}
+
+void WebServer::schedule_ota_reboot_() {
+  ESP_LOGI(TAG, "OTA update successful!");
+  this->set_timeout(2000, []() {
+    ESP_LOGI(TAG, "Performing OTA reboot now");
+    App.safe_reboot();
+  });
+}
+
+void WebServer::ota_init_(const char *filename) {
+  ESP_LOGI(TAG, "OTA Update Start: %s", filename);
+  this->ota_read_length_ = 0;
+  this->ota_success_ = false;
+}
+
+
+
+bool WebServer::handleUpload(size_t bodylen, const PlatformString &filename, size_t index, uint8_t *data, size_t len, bool final) {
+                                      
+ota::OTAResponseTypes error_code = ota::OTA_RESPONSE_OK;
+char buf[100];
+//ESP_LOGD("test", "before index");
+  if (index == 0 && !this->ota_backend_) {
+ //   ESP_LOGD("test", "after index");
+    // Initialize OTA on first call
+    this->ota_init_(filename.c_str());
+
+ snprintf(buf, 100, "OTA Update Started: %s", filename.c_str());
                 this->push(OTA, buf);
-                ESP_LOGI(TAG, "OTA Update Start: %s", filename.c_str());
 
-                this->ota_read_length_ = 0;
-
-                if (Update.isRunning())
-                {
-                    Update.abort();
-                    return false;
-                }
-#if defined(USE_DSC_PANEL) || defined(USE_VISTA_PANEL)
-                if (alarm_panel::alarmPanelPtr != NULL)
-                {
-                    alarm_panel::alarmPanelPtr->stop();
-                }
+    // Platform-specific pre-initialization
+#ifdef USE_ARDUINO
+#ifdef USE_ESP8266
+  //  Update.runAsync(false);
 #endif
-                success = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
-
-                if (!success)
-                {
-                    report_ota_error();
-                    return false;
-                }
-            }
-            else if (Update.hasError())
-            {
-                report_ota_error();
-                return false;
-            }
-
-            success = Update.write(data, len) == len;
-
-            if (!success)
-            {
-                report_ota_error();
-                return false;
-            }
-            this->ota_read_length_ += len;
-
-            const uint32_t now = millis();
-            if (now - this->last_ota_progress_ > 1000)
-            {
-                if (bodylen != 0)
-                {
-                    float percentage = (this->ota_read_length_ * 100.0f) / bodylen;
-                    ESP_LOGD(TAG, "OTA in progress: %0.1f%%", percentage);
-                    snprintf(buf, 100, "OTA in progress: %0.1f%%", percentage);
-                    this->push(OTA, buf);
-                }
-                else
-                {
-                    ESP_LOGD(TAG, "OTA in progress: %u bytes read", this->ota_read_length_);
-                    snprintf(buf, 100, "OTA in progress: %u bytes read", this->ota_read_length_);
-                    this->push(OTA, buf);
-                }
-
-                this->last_ota_progress_ = now;
-            }
-
-            if (final)
-            {
-                if (Update.end(true))
-                {
-                    ESP_LOGI(TAG, "OTA update successful!");
-                    this->push(OTA, "OTA Update successful. Press F5 to reload this page.");
-                    this->set_timeout(2000, []()
-                                      { App.safe_reboot(); });
-                    return true;
-                }
-                else
-                {
-                    report_ota_error();
-                    return false;
-                }
-            }
+#if defined(USE_ESP32) || defined(USE_LIBRETINY)
+    if (Update.isRunning()) {
+      Update.abort();
+    }
 #endif
-            return true;
-        }
-#endif
+#endif  // USE_ARDUINO
+
+    this->ota_backend_ = ota::make_ota_backend();
+    if (!this->ota_backend_) {
+      snprintf(buf,100, "Failed to create OTA backend");
+     #ifdef ESP8266
+      ESP_LOGE(TAG,"Failed to create OTA backend");
+     #else
+      ESP_LOGE(TAG,buf);
+     #endif
+
+      this->push(OTA, buf);
+      return false;
+    }
+
+    error_code = this->ota_backend_->begin(bodylen);
+    if (error_code != ota::OTA_RESPONSE_OK) {
+      snprintf(buf, 100,"OTA begin failed: %d", error_code);
+     #ifdef ESP8266
+      ESP_LOGE(TAG,"OTA begin failed: %d", error_code);
+     #else
+      ESP_LOGE(TAG,buf);
+      #endif
+      this->push(OTA, buf);
+      this->ota_backend_.reset();
+      return false;
+    }
+  }
+
+  if (!this->ota_backend_) {
+    return false;
+  }
+
+  // Process data
+  if (len > 0) {
+   // ESP_LOGD("test", "in process data");
+    error_code = this->ota_backend_->write(data, len);
+    if (error_code != ota::OTA_RESPONSE_OK) {
+      snprintf(buf,100, "OTA write failed: %d", error_code);
+     #ifdef ESP8266
+      ESP_LOGE(TAG,"OTA write failed: %d", error_code);
+     #else
+      ESP_LOGE(TAG,buf);
+      #endif
+      this->push(OTA, buf);
+      this->ota_backend_->abort();
+      this->ota_backend_.reset();
+      return false;
+    }
+    this->ota_read_length_ += len;
+    this->report_ota_progress_();
+  }
+  
+
+  // Finalize
+  if (final) {
+    ESP_LOGD(TAG, "OTA final chunk: index=%zu, len=%zu, total_read=%" PRIu32 ", contentLength=%zu", index, len,
+             this->ota_read_length_, bodylen);
+
+    // For Arduino framework, the Update library tracks expected size from firmware header
+    // If we haven't received enough data, calling end() will fail
+    // This can happen if the upload is interrupted or the client disconnects
+    error_code = this->ota_backend_->end();
+    if (error_code == ota::OTA_RESPONSE_OK) {
+      this->ota_success_ = true;
+      snprintf(buf, 100,"OTA completed");
+      this->push(OTA, buf);
+      this->schedule_ota_reboot_();
+    } else {
+      snprintf(buf, 100,"OTA end failed: %d", error_code);
+     #ifdef ESP8266
+      ESP_LOGE(TAG,"OTA end failed: %d", error_code);
+     #else
+      ESP_LOGE(TAG,buf);
+      #endif
+      this->push(OTA, buf);
+      this->ota_backend_.reset();
+      return false;
+    }
+    this->ota_backend_.reset();
+    
+  }
+   return true;
+ }
+#endif //web_keypad_ota
+
     } // namespace web_server
 } // namespace esphome

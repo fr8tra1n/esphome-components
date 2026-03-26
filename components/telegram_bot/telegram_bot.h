@@ -1,5 +1,6 @@
 #pragma once
 #include "esphome/core/defines.h"
+#include "esphome/core/version.h"
 #include "esphome/core/component.h"
 #include "esphome/core/controller.h"
 #include "esphome/core/automation.h"
@@ -14,6 +15,16 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #endif
+
+#ifdef USE_ESP_IDF
+#define PSTR(s)   ((const char *)(s))
+#endif
+
+#if defined(USE_RP2040) && not defined(ESP)
+#define ESP rp2040
+#endif
+
+//#define USETASK
 
 namespace esphome
 {
@@ -41,6 +52,7 @@ namespace esphome
       std::string args;
       bool is_callback;
       std::string message_id;
+      std::string inline_message_id;
       std::string callback_id;
       bool is_first_cmd;
       std::string to;
@@ -57,6 +69,7 @@ namespace esphome
       std::string reply_markup = "";
       std::string callback_id = "";
       std::string parse_mode = "";
+      std::string inline_message_id="";
       bool disable_notification = false;
       bool disable_web_page_preview = false;
       bool resize_keyboard = false;
@@ -68,20 +81,21 @@ namespace esphome
       std::string url;
     };
 
-
-    struct c_res_s
-    {
-      int i = 0;
-      struct mg_connection *c;
-    };
+    #if defined (USE_ESP_IDF)
+    static unsigned long millis() {
+     return esp_timer_get_time() / 1000;
+    }
+ #endif
 
     class WebNotify : public Controller, public Component
     {
     public:
       WebNotify();
+      ~WebNotify();
 
       void setup() override;
       void loop() override;
+      float get_setup_priority() const override { return -100.0f; }
 
       void dump_config() override;
       void publish(SendData &out);
@@ -142,7 +156,7 @@ namespace esphome
       {
         SendData out;
         out.text = message;
-        out.message_id = callback_id;
+        out.callback_id = callback_id;
         out.show_alert = show_alert;
         out.url = url;
         out.cache_time = cache_time;
@@ -152,10 +166,15 @@ namespace esphome
         publish(out);
       }
 
-      void editMessageText(const std::string &chat_id, const std::string &message, const std::string &message_id, const std::string &inline_keyboard = "", const std::string &parse_mode = "html", bool disable_web_page_preview = false)
+
+      void editMessageText(const std::string &message,  const std::string &message_id, const std::string &chat_id ="", const std::string &inline_keyboard = "", const std::string &parse_mode = "html", bool disable_web_page_preview = false)
       {
+        if (message_id=="") return;
         SendData out;
-        out.chat_id = chat_id;
+        if (chat_id.length() > 0)
+          out.chat_id = chat_id;
+        else
+          out.chat_id=this->telegramUserId_;
         out.text = message;
         out.message_id = message_id;
         out.reply_markup = "{'inline_keyboard':" + inline_keyboard + "}";
@@ -165,7 +184,7 @@ namespace esphome
         publish(out);
       }
 
-      void editMessageReplyMarkup(const std::string &chat_id, const std::string &message_id, const std::string &inline_keyboard = "", bool disable_web_page_preview = false)
+      void editMessageReplyMarkup(const std::string &message_id, const std::string &chat_id = "", const std::string &inline_keyboard = "", bool disable_web_page_preview = false)
       {
         SendData out;
         out.chat_id = chat_id;
@@ -215,10 +234,13 @@ namespace esphome
       void set_bot_id_f(std::function<optional<std::string>()> &&f);
       void set_chat_id_f(std::function<optional<std::string>()> &&f);
 
+      void ev_handler(struct mg_connection *c, int ev, void *ev_data);
+     
     private:
 
-      struct mg_mgr mgr_;
-      static void notify_fn(struct mg_connection *c, int ev, void *ev_data);
+
+      struct mg_mgr  mgr_;
+     
 
       bool botRequest_{};
       bool skipFirst_{};
@@ -231,13 +253,12 @@ namespace esphome
         msgtype type;
       };
 
-      // #ifdef ESP32
-      //       TaskHandle_t xHandle;
-      //       static void telegramTask(void *args);
-      // #endif
+      #ifdef USETASK
+      TaskHandle_t xHandle;
+      static void telegramTask(void *args);
+      #endif
 
-      struct c_res_s c_res_;
-
+   
       std::string apiHost_ = "https://api.telegram.org/";
       int lastMsgReceived_ = 0;
       std::string botId_ = "";
@@ -252,6 +273,7 @@ namespace esphome
       unsigned long retryDelay_ = 0;
       int delayTime_ = 15000; // ms
       uint8_t pollTimeout_=120; //seconds
+      uint64_t currentPollTime_=0; //millis
       std::queue<outMessage> messages_;
       std::vector<std::string> allowed_chat_ids_;
       bool isAllowed(std::string chat_id);
@@ -261,8 +283,6 @@ namespace esphome
       optional<std::function<optional<std::string>()>> chat_id_f_{};
       optional<std::function<optional<std::string>()>> bot_id_f_{};
     };
-
-    extern WebNotify *global_notify;
 
     template <typename... Ts>
     class TelegramPublishAction : public Action<Ts...>
@@ -282,42 +302,48 @@ namespace esphome
       TEMPLATABLE_VALUE(bool, one_time_keyboard)
       TEMPLATABLE_VALUE(bool, force)
 
-      void play(Ts... x) override
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+  void play(const Ts&... x) override
+#else
+  void play(Ts... x) override
+#endif
       {
-        SendData y;
+        //SendData y;
+         SendData * y = new SendData;
 
         if (this->keyboard_.value(x...) != "")
           if (this->keyboard_.value(x...) == "none" || this->keyboard_.value(x...) == "false")
-            y.reply_markup = "{remove_keyboard: true}";
+            y->reply_markup = "{remove_keyboard: true}";
           else
-            y.reply_markup = "{'keyboard':" + std::move(this->keyboard_.value(x...)) + "}";
+            y->reply_markup = "{'keyboard':" + std::move(this->keyboard_.value(x...)) + "}";
         else if (this->inline_keyboard_.value(x...) != "")
-          y.reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
+          y->reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
         if (this->reply_markup_.value(x...) != "")
-          y.reply_markup = this->reply_markup_.value(x...);
+          y->reply_markup = this->reply_markup_.value(x...);
         if (this->parse_mode_.value(x...) != "")
-          y.parse_mode = this->parse_mode_.value(x...);
+          y->parse_mode = this->parse_mode_.value(x...);
         if (this->to_.value(x...) != "")
-          y.chat_id = this->to_.value(x...);
+          y->chat_id = this->to_.value(x...);
         else
-          y.chat_id = this->parent_->telegramUserId_;
+          y->chat_id = this->parent_->telegramUserId_;
 
         if (this->disable_notification_.value(x...))
-          y.disable_notification = this->disable_notification_.value(x...);
+          y->disable_notification = this->disable_notification_.value(x...);
         if (this->disable_web_page_preview_.value(x...))
-          y.disable_web_page_preview = this->disable_web_page_preview_.value(x...);
+          y->disable_web_page_preview = this->disable_web_page_preview_.value(x...);
         if (this->resize_keyboard_.value(x...))
-          y.resize_keyboard = this->resize_keyboard_.value(x...);
+          y->resize_keyboard = this->resize_keyboard_.value(x...);
         if (this->one_time_keyboard_.value(x...))
-          y.one_time_keyboard = this->one_time_keyboard_.value(x...);
+          y->one_time_keyboard = this->one_time_keyboard_.value(x...);
 
-        y.text = this->message_.value(x...);
+        y->text = this->message_.value(x...);
         if (this->title_.value(x...) != "")
-          y.text = this->title_.value(x...) + "\n" + y.text;
+          y->text = this->title_.value(x...) + "\n" + y->text;
         if (this->force_.value(x...))
-          y.force = this->force_.value(x...);
-        y.type = mtSendMessage;
-        this->parent_->publish(y);
+          y->force = this->force_.value(x...);
+        y->type = mtSendMessage;
+        this->parent_->publish(*y);
+        delete y;
       }
 
     protected:
@@ -335,17 +361,23 @@ namespace esphome
       TEMPLATABLE_VALUE(std::string, url)
       TEMPLATABLE_VALUE(int, cache_time)
 
-      void play(Ts... x) override
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+  void play(const Ts&... x) override
+#else
+  void play(Ts... x) override
+#endif
       {
-        SendData y;
-        y.callback_id = this->callback_id_.value(x...);
+        //SendData y;
+         SendData * y = new SendData;
+        y->callback_id = this->callback_id_.value(x...);
         if (this->show_alert_.value(x...))
-          y.show_alert = this->show_alert_.value(x...);
-        y.text = this->message_.value(x...);
-        y.url = this->url_.value(x...);
-        y.cache_time = this->cache_time_.value(x...);
-        y.type = mtAnswerCallbackQuery;
-        this->parent_->publish(y);
+          y->show_alert = this->show_alert_.value(x...);
+        y->text = this->message_.value(x...);
+        y->url = this->url_.value(x...);
+        y->cache_time = this->cache_time_.value(x...);
+        y->type = mtAnswerCallbackQuery;
+        this->parent_->publish(*y);
+        delete y;
       }
 
     protected:
@@ -359,15 +391,20 @@ namespace esphome
       TelegramDeleteMessageAction(WebNotify *parent) : parent_(parent) {}
       TEMPLATABLE_VALUE(std::string, chat_id)
       TEMPLATABLE_VALUE(std::string, message_id)
-
-      void play(Ts... x) override
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+  void play(const Ts&... x) override
+#else
+  void play(Ts... x) override
+#endif
       {
-        SendData y;
-        y.chat_id = this->chat_id_.value(x...);
-        y.message_id = this->message_id_.value(x...);
+        //SendData y;
+         SendData * y = new SendData;
+        y->chat_id = this->chat_id_.value(x...);
+        y->message_id = this->message_id_.value(x...);
 
-        y.type = mtDeleteMessage;
-        this->parent_->publish(y);
+        y->type = mtDeleteMessage;
+        this->parent_->publish(*y);
+        delete y;
       }
 
     protected:
@@ -388,24 +425,30 @@ namespace esphome
       TEMPLATABLE_VALUE(bool, disable_web_page_preview)
       TEMPLATABLE_VALUE(std::string, reply_markup)
 
-      void play(Ts... x) override
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+  void play(const Ts&... x) override
+#else
+  void play(Ts... x) override
+#endif
       {
-        SendData y;
-        y.chat_id = this->chat_id_.value(x...);
+        //SendData y;
+         SendData * y = new SendData;
+        y->chat_id = this->chat_id_.value(x...);
         if (this->inline_keyboard_.value(x...) != "")
-          y.reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
+          y->reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
         if (this->reply_markup_.value(x...) != "")
-          y.reply_markup = this->reply_markup_.value(x...);
+          y->reply_markup = this->reply_markup_.value(x...);
         if (this->parse_mode_.value(x...) != "")
-          y.parse_mode = this->parse_mode_.value(x...);
+          y->parse_mode = this->parse_mode_.value(x...);
         if (this->disable_web_page_preview_.value(x...))
-          y.disable_web_page_preview = this->disable_web_page_preview_.value(x...);
-        y.text = this->message_.value(x...);
-        y.message_id = this->message_id_.value(x...);
+          y->disable_web_page_preview = this->disable_web_page_preview_.value(x...);
+        y->text = this->message_.value(x...);
+        y->message_id = this->message_id_.value(x...);
         if (this->title_.value(x...) != "")
-          y.text = this->title_.value(x...) + "\n" + y.text;
-        y.type = mtEditMessageText;
-        this->parent_->publish(y);
+          y->text = this->title_.value(x...) + "\n" + y->text;
+        y->type = mtEditMessageText;
+        this->parent_->publish(*y);
+        delete y;
       }
 
     protected:
@@ -423,31 +466,37 @@ namespace esphome
       TEMPLATABLE_VALUE(std::string, inline_keyboard)
       TEMPLATABLE_VALUE(bool, disable_web_page_preview)
 
-      void play(Ts... x) override
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2025, 11, 0)
+  void play(const Ts&... x) override
+#else
+  void play(Ts... x) override
+#endif
       {
 
-        SendData y;
-        y.chat_id = this->chat_id_.value(x...);
+        //SendData y;
+         SendData * y = new SendData;
+        y->chat_id = this->chat_id_.value(x...);
         if (this->inline_keyboard_.value(x...) != "")
-          y.reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
+          y->reply_markup = "{'inline_keyboard':" + std::move(this->inline_keyboard_.value(x...)) + "}";
         if (this->reply_markup_.value(x...) != "")
-          y.reply_markup = this->reply_markup_.value(x...);
+          y->reply_markup = this->reply_markup_.value(x...);
         if (this->disable_web_page_preview_.value(x...))
-          y.disable_web_page_preview = this->disable_web_page_preview_.value(x...);
-        y.message_id = this->message_id_.value(x...);
-        y.text = this->message_.value(x...);
-        y.type = mtEditMessageReplyMarkup;
-        this->parent_->publish(y);
+          y->disable_web_page_preview = this->disable_web_page_preview_.value(x...);
+        y->message_id = this->message_id_.value(x...);
+        y->text = this->message_.value(x...);
+        y->type = mtEditMessageReplyMarkup;
+        this->parent_->publish(*y);
+        delete y;
       }
 
     protected:
       WebNotify *parent_;
     };
 
-    class TelegramMessageTrigger : public Trigger<RemoteData>
+    class TelegramMessageTrigger : public Trigger<RemoteData&>
     {
     public:
-      bool stringsEqual(std::string str1, std::string str2)
+      bool stringsEqual(std::string &str1, std::string &str2)
       {
         if (str1.length() != str2.length())
           return false;
@@ -461,40 +510,52 @@ namespace esphome
         return true;
       }
 
-      explicit TelegramMessageTrigger(const std::string &cmd, const std::string &type)
+      void processMessage(const std::string &cmd, const std::string &type,WebNotify * parent, RemoteData &x)
       {
-        global_notify->set_on_message([cmd, type, this](RemoteData &x)
-                                      {
-                                        std::string s = x.cmd;
-                                        // ESP_LOGD("test","callback is %d, type=%s,cmd=%s",x.is_callback,type.c_str(),cmd.c_str());
+          std::string s = x.cmd;
+          std::string bn=parent->get_bot_name();
+         // printf("Processing cmd %s, type %s, s %s\n",cmd.c_str(),type.c_str(),s.c_str());
+          if (x.to !="" && !stringsEqual(x.to,bn) )
+            return;
 
-                                        if (x.to !="" && !stringsEqual(x.to,global_notify->get_bot_name()) )
-                                          return;
+          if (type == "callback")
+          {
+            if (!x.is_callback)
+              return;
+              //printf("Answering callback to id %s\n",x.callback_id.c_str());
+              //parent->answerCallbackQuery("", x.callback_id);
+            s = x.text;
+          }
+          if (type == "cmd")
+          {
+            if (x.cmd == "" || x.is_callback)
+              return;
+          }
 
-                                        if (type == "callback")
-                                        {
-                                          if (!x.is_callback)
-                                            return;
-                                          s = x.text;
-                                        }
-                                        if (type == "cmd")
-                                        {
-                                          if (x.cmd == "" || x.is_callback)
-                                            return;
-                                        }
+          if (type == "text")
+          {
+            if (x.cmd != "" || x.is_callback)
+              return;
+            s = x.text;
+          }
+          
 
-                                        if (type == "text")
-                                        {
-                                          if (x.cmd != "" || x.is_callback)
-                                            return;
-                                          s = x.text;
-                                        }
-                                        
+          if (cmd.find("," + s + ",") != std::string::npos)
+           this->trigger(x);
 
-                                        if (cmd.find("," + s + ",") != std::string::npos)
-                                          this->trigger(x);
-                                        if (cmd.find(",*,") != std::string::npos)
-                                          this->trigger(x); });
+          if (cmd.find(",*,") != std::string::npos)
+           this->trigger(x) ;
+
+      
+        }
+
+      explicit TelegramMessageTrigger(const std::string &cmd, const std::string &type,WebNotify * parent)
+      {
+        parent->set_on_message([cmd, type, this, parent](RemoteData &x)
+        {
+            processMessage(cmd,type,parent,x);
+          
+        });
       };
     };
 

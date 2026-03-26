@@ -1,7 +1,7 @@
 #for documentation see project at https://github.com/Dilbert66/esphome-dsckeybus
 substitutions:
   name: "dscalarm" #unique network name
-  friendlyName: "DSC Alarm" #friendly name for this device
+  friendlyName: "DSCAlarm" #friendly name for this device
   panelId: DSCAlarm  #used as the service variable name.
   
 dsc_alarm_panel:
@@ -41,8 +41,8 @@ dsc_alarm_panel:
   #dscreadpin: "4"
   #dscwritepin: "15" 
 
-  #periodic check for trouble messages in seconds. Minium 30s. Defaults to 120s (2 minutes)
-  trouble_fetch_update_time: 120
+  #periodic check for trouble messages in seconds. Minium 30s. Defaults to 0
+  trouble_fetch_update_time: 0
 
   #flag to have the esp check for trouble statuses for devices/zones when the trouble light goes on or off
   #Note: It will prevent the physical panel from beeping to let you know as the check resets the beep.
@@ -55,13 +55,16 @@ dsc_alarm_panel:
   #triggered,armed_home,armed_away,armed_night,pending,arming,disarmed
   #the default is "false"
   detailed_partition_state: false
+
+  # esp32 only. Set this flag to true if you are getting garbage data in your logs
+  use_esp_idf_timer: false
  
   clean_build: "false" #default is false.  set to true if getting duplication errors in linking step.  
 
 esp32: 
   board: nodemcu-32s
   framework: 
-    type: arduino
+    type: esp-idf
     version: recommended
 
 #esp8266:    
@@ -158,6 +161,7 @@ logger:
 api:
    encryption:
     key: !secret encryption_key
+   custom_services: true
     
     
 #to use mqtt disable the api: section above. This enables you to use esphome with 

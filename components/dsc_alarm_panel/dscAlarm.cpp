@@ -1,6 +1,14 @@
 // for project documentation visit https://github.com/Dilbert66/esphome-dsckeybus
 
 #include "dscAlarm.h"
+#if !defined(ARDUINO_MQTT)
+#include "esphome/components/network/util.h"
+#endif
+
+#if defined(ESP32) 
+#include <esp_chip_info.h>
+#include <esp_task_wdt.h>
+#endif
 
 static const char *const TAG = "dscalarm";
 
@@ -21,6 +29,18 @@ namespace esphome
 {
   namespace alarm_panel
   {
+
+#if defined(ESP8266)
+#define FC(s) (String(FPSTR(s)).c_str())
+#define FCS(s) (String(PSTR(s)).c_str()) 
+#else
+#define FC(s) ((const char*)(s))
+#define FCS(s) ((const char*)(s))
+#endif
+
+
+
+
 #endif
     DSCkeybushome *alarmPanelPtr;
 #if defined(ESPHOME_MQTT)
@@ -51,11 +71,11 @@ void DSCkeybushome::publishBinaryState(const std::string &idstr, uint8_t num, bo
   {
     id += "_" + std::to_string(num);
   }
-  auto it = std::find_if(bMap.begin(), bMap.end(), [id](binary_sensor::BinarySensor *bs)
-                         { return bs->get_object_id() == id; });
-
-  if (it != bMap.end() && (*it)->state != open)
-    (*it)->publish_state(open);
+  auto s=getSensorObj(id.c_str());
+  if (s != nullptr && s->sensorPtr != nullptr  && s->is_binary) {
+    binary_sensor::BinarySensor * bs = reinterpret_cast<binary_sensor::BinarySensor*> (s->sensorPtr);
+    bs->publish_state(open);
+  }
 }
 
 void DSCkeybushome::publishTextState(const std::string &idstr, uint8_t num, std::string *text)
@@ -65,10 +85,12 @@ void DSCkeybushome::publishTextState(const std::string &idstr, uint8_t num, std:
   {
     id += "_" + std::to_string(num);
   }
-  auto it = std::find_if(tMap.begin(), tMap.end(), [id](text_sensor::TextSensor *ts)
-                         { return ts->get_object_id() == id; });
-  if (it != tMap.end() && (*it)->state != *text)
-    (*it)->publish_state(*text);
+  auto s=getSensorObj(id.c_str());
+  if (s != nullptr && s->sensorPtr != nullptr && !s->is_binary) {
+    text_sensor::TextSensor * ts = reinterpret_cast<text_sensor::TextSensor*>(s->sensorPtr);
+    ts->publish_state(*text);
+  }
+
 }
 #endif
 
@@ -88,18 +110,29 @@ void DSCkeybushome::publishTextState(const std::string &idstr, uint8_t num, std:
 
     std::string DSCkeybushome::getZoneName(int zone, bool append)
     {
+     if (zone < 1 || zone > maxZones) return "";
 #if !defined(ARDUINO_MQTT)
-      std::string c = "z" + std::to_string(zone);
-      auto it = std::find_if(bMap.begin(), bMap.end(), [c](binary_sensor::BinarySensor *bs)
-                             { return bs->get_object_id() == c; });
-      if (it != bMap.end())
-      {
-        if (append)
-          // return std::to_string(zone).append(" (").append((*it)->get_name()).append(")");
-          return std::string((*it)->get_name()).append(" (").append(std::to_string(zone)).append(")");
-        else
-          return (*it)->get_name();
+
+      auto it = std::find_if(zoneStatus.begin(), zoneStatus.end(), [zone](sensorObjType &f)
+                             { return f.zone == zone; });
+      if (it != zoneStatus.end()) {
+                sensorObjType s = (*it);
+                if (s.sensorPtr != nullptr) {
+                const char * name;
+                if (s.is_binary) {
+                  name = reinterpret_cast<binary_sensor::BinarySensor *>(s.sensorPtr)->get_name().c_str();
+                } else {
+                  name = reinterpret_cast<text_sensor::TextSensor *>(s.sensorPtr)->get_name().c_str();
+                }
+
+                   if (append)
+                  return std::string(name).append(" (").append(std::to_string(zone)).append(")");
+                  else
+                  return  std::string(name);
+                }
+            
       }
+      
 #endif
       return "";
     }
@@ -149,17 +182,47 @@ void DSCkeybushome::publishTextState(const std::string &idstr, uint8_t num, std:
         troubleFetch = false;
     }
 
-    DSCkeybushome::zoneType *DSCkeybushome::getZone(byte z,bool create)
+    DSCkeybushome::sensorObjType *DSCkeybushome::getZone(byte z,bool create)
     {
       // zone=0 to maxZones-1
-      auto it = std::find_if(zoneStatus.begin(), zoneStatus.end(), [&z](zoneType &f)
+      auto it = std::find_if(zoneStatus.begin(), zoneStatus.end(), [&z](sensorObjType &f)
                              { return f.zone == z + 1; });
       if (it != zoneStatus.end())
         return &(*it);
       else {
-        return create?createZone(z+1):&zonetype_INIT;
+        sensorObjType_NULL=sensorObjType_INIT;
+        return create?createZone(z+1):&sensorObjType_NULL;
       }
 
+    }
+
+    DSCkeybushome::sensorObjType *DSCkeybushome::getSensorObj(const char *id_type)
+    {
+ 
+      auto it = std::find_if(zoneStatus.begin(), zoneStatus.end(), [id_type](sensorObjType &f)
+                             { return strcmp(f.id_type,id_type) == 0; });
+      if (it != zoneStatus.end())
+        return &(*it);
+      else {
+        return nullptr;
+      }
+
+    }
+
+    const char * DSCkeybushome::getIdType(uint32_t hash)
+    {
+
+       if (hash==0) return "";
+      auto it = std::find_if(zoneStatus.begin(), zoneStatus.end(), [hash](sensorObjType &f)
+                             { 
+                              return f.hash==hash;
+                             });
+
+      if (it != zoneStatus.end())
+        return (*it).id_type;
+      else 
+        return "";
+       
     }
 
 #if defined(ARDUINO_MQTT)
@@ -170,17 +233,11 @@ void DSCkeybushome::publishTextState(const std::string &idstr, uint8_t num, std:
 void DSCkeybushome::setup()
 {
 #endif
-
-#if !defined(ARDUINO_MQTT)
-      bMap = App.get_binary_sensors();
-      tMap = App.get_text_sensors();
-#endif
       eventStatusMsg.reserve(64);
-      if (debug > 2)
-        Serial.begin(115200);
-#if !defined(ARDUINO_MQTT)
-      loadZones();
-#endif
+      #if defined(ARDUINO_MQTT)
+       if (debug > 2)
+         Serial.begin(115200);
+      #endif
 
 #if defined(ESPHOME_MQTT)
 
@@ -188,29 +245,34 @@ void DSCkeybushome::setup()
       mqtt::MQTTDiscoveryInfo mqttDiscInfo = mqtt::global_mqtt_client->get_discovery_info();
       std::string discovery_prefix = mqttDiscInfo.prefix;
       topic = discovery_prefix + "/alarm_control_panel/" + topic_prefix + "/config";
-      mqtt::global_mqtt_client->subscribe_json(topic_prefix + String(FPSTR(setalarmcommandtopic)).c_str(), mqtt_callback);
+      mqtt::global_mqtt_client->subscribe_json(topic_prefix + setalarmcommandtopic, mqtt_callback);
 #endif
 #if defined(USE_API)
+ #if defined(USE_API_CUSTOM_SERVICES) or defined(USE_API_SERVICES)
       register_service(&DSCkeybushome::set_alarm_state, "set_alarm_state", {"state", "code", "partition"});
       register_service(&DSCkeybushome::alarm_disarm, "alarm_disarm", {"code"});
+      #if defined(USE32)
 #if !defined(ARDUINO_MQTT) && defined(USE_TIME)
       register_service(&DSCkeybushome::set_panel_time, "set_panel_time", {});
 #else
       register_service(&DSCkeybushome::set_panel_time_manual, "set_panel_time_manual", {"year", "month", "day", "hour", "minute"});
 #endif
+#endif
       register_service(&DSCkeybushome::alarm_arm_home, "alarm_arm_home");
-      register_service(&DSCkeybushome::alarm_arm_night, "alarm_arm_night", {"code"});
+      register_service(&DSCkeybushome::alarm_arm_night,"alarm_arm_night", {"code"});
       register_service(&DSCkeybushome::alarm_arm_away, "alarm_arm_away");
       register_service(&DSCkeybushome::alarm_trigger_panic, "alarm_trigger_panic");
       register_service(&DSCkeybushome::alarm_trigger_fire, "alarm_trigger_fire");
       register_service(&DSCkeybushome::alarm_keypress, "alarm_keypress", {"keys"});
       register_service(&DSCkeybushome::alarm_keypress_partition, "alarm_keypress_partition", {"keys", "partition"});
       register_service(&DSCkeybushome::set_zone_fault, "set_zone_fault", {"zone", "fault"});
-      register_service(&DSCkeybushome::set_default_partition, "set_default_partition", {"partition"});
+     // register_service(&DSCkeybushome::set_default_partition, "set_default_partition", {"partition"});
+      #else
+      #error "Missing "custom_services: true" line in the api: section"
+      #endif
 #endif
 
-      firstrun = true;
-      publishSystemStatus(String(FPSTR(STATUS_OFFLINE)).c_str());
+      publishSystemStatus(FC(STATUS_OFFLINE));
       forceDisconnect = false;
 #ifdef MODULESUPERVISION
       dsc.enableModuleSupervision = 1;
@@ -223,19 +285,38 @@ void DSCkeybushome::setup()
       dsc.resetStatus();
       dsc.processModuleData = true;
 
-      if (dscClockPin && dscReadPin && dscWritePin)
-        dsc.begin(Serial, dscClockPin, dscReadPin, dscWritePin, invertWrite);
-      else
-        dsc.begin(Serial);
+// #ifdef USE_ESP_IDF
+//       esp_chip_info_t info;
+//       esp_chip_info(&info);
+//       ESP_LOGE(TAG, "Cores: %d", info.cores);
+//       ESP_LOGE(TAG,"Running on core %d",xPortGetCoreID());
+//       uint8_t core = info.cores > 1 ? 1 : 0;
+//       TaskHandle_t setupHandle;
+//       xTaskCreatePinnedToCore(
+//       this->setupTask, // setup task
+//       "setupTask",     // Name of the task
+//         3000,               // Stack size in words
+//       (void *)this,       // Task input parameter
+//       10,                 // Priority of the task
+//       &setupHandle            // Task handle.
+//       ,
+//       core // Core where the task should run. If only one core, core will be ignored
+//   );
 
+// #else
+//       if (dscClockPin && dscReadPin )
+//         dsc.begin(dscClockPin, dscReadPin, dscWritePin, invertWrite);
+//       else
+//         dsc.begin();
+// #endif
       for (int p = 0; p < dscPartitions; p++)
       {
-        partitionStatus[p].editIdx = 0;
-        partitionStatus[p].digits = 0;
+
+        partitionStatus[p]={0,0,NULL,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
         publishBeeps("0", p + 1);
         publishPartitionMsg("No messages", p + 1);
         publishPartitionStatus("No messages", p + 1);
-        publishLine1("ESP Module Start", p + 1);
+        publishLine1(FC("ESP Module Start"), p + 1);
         publishLine2(" ", p + 1);
         publishUserArmingDisarming(" ", p + 1);
         publishZoneAlarm(" ", p + 1);
@@ -246,9 +327,35 @@ void DSCkeybushome::setup()
       system1 = 0;
       system0 = 0;
       publishTroubleMsgStatus("No messages");
-      publishEventInfo("ESP module start");
+      publishEventInfo(FC("ESP module start"));
       publishZoneMsgStatus("No messages");
     }
+
+#ifdef USE_ESP_IDF
+    void DSCkeybushome::setupTask(void *args)
+    {
+      //ensure we run dsc setup on correct core.  This task is only setup to init the interrupts and pins, otherwise it's idle
+      DSCkeybushome *_this = (DSCkeybushome *)args;
+      if (_this->dscClockPin && _this->dscReadPin )
+        dsc.begin(_this->dscClockPin, _this->dscReadPin, _this->dscWritePin, _this->invertWrite);
+      else
+        dsc.begin();
+       unsigned long checkTime=_this->millis();
+      for (;;)
+      {
+          vTaskDelay(1000 / portTICK_PERIOD_MS);
+          if (_this->millis() - checkTime > 300000)
+          {
+            checkTime = _this->millis();
+#if not defined(ARDUINO_MQTT)
+            UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGD(TAG, "High water stack level: %5d", (uint16_t)uxHighWaterMark);
+#endif
+          }
+      }
+
+    }
+#endif
 
     std::string DSCkeybushome::getUserName(int usercode, bool append, bool returncode)
     {
@@ -299,7 +406,7 @@ void DSCkeybushome::setup()
 #if !defined(ARDUINO_MQTT)
       ESP_LOGI(TAG, "Setting Zone Fault: %d,%d", zone, fault);
 #else
-      Serial.printf("Setting Zone Fault: %d,%d\n", zone, fault);
+      Serial.printf("Setting Zone Fault: %d,%d\n", zone, fault); 
 #endif
       dsc.setZoneFault(zone, fault);
 
@@ -352,8 +459,8 @@ void DSCkeybushome::setup()
 
       if (partitionStatus[partition - 1].locked)
       {
-        publishLine1(String(F("System")).c_str(), partition);
-        publishLine2(String(F("not available")).c_str(), partition);
+        publishLine1(FC("System"), partition);
+        publishLine2(FC("not available"), partition);
         return;
       }
       /*
@@ -368,14 +475,14 @@ void DSCkeybushome::setup()
       */
       if (partitionStatus[partition - 1].digits > 0)
       { // program mode data input
-        String tpl = F("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+        std::string tpl =FCS("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
         if (dsc.status[partition - 1] == 0xAA)
         { // time entry
-          tpl = F("XXXX    XXXXXX  XXXXXXXXXXXXXXXX");
+          tpl = FCS("XXXX    XXXXXX  XXXXXXXXXXXXXXXX");
         }
         if (dsc.status[partition - 1] == 0xAB)
         { // time entry
-          tpl = F("XXXX                            ");
+          tpl = FCS("XXXX                            ");
         }
 
         if (key == '#')
@@ -500,7 +607,7 @@ void DSCkeybushome::setup()
           if (*currentSelection == 8)
             *currentSelection -= 1; // skip empty item
           if (*currentSelection < mmsize)
-            publishLine2(String(FPSTR(mainMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(mainMenu[*currentSelection]), partition);
         }
         else if (key == '>')
         {
@@ -508,7 +615,7 @@ void DSCkeybushome::setup()
           if (*currentSelection == 8)
             *currentSelection += 1;
           if (*currentSelection < mmsize)
-            publishLine2(String(FPSTR(mainMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(mainMenu[*currentSelection]), partition);
         }
         else if (key == '*' && *currentSelection > 0)
         {
@@ -539,13 +646,13 @@ void DSCkeybushome::setup()
         {
           *currentSelection = getNextOption(*currentSelection);
           if (*currentSelection < tmsize)
-            publishLine2(String(FPSTR(troubleMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(troubleMenu[*currentSelection]), partition);
         }
         else if (key == '<')
         {
           *currentSelection = getPreviousOption(*currentSelection);
           if (*currentSelection < tmsize)
-            publishLine2(String(FPSTR(troubleMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(troubleMenu[*currentSelection]), partition);
         }
         else
         {
@@ -567,13 +674,13 @@ void DSCkeybushome::setup()
         {
           *currentSelection = getNextOption(*currentSelection);
           if (*currentSelection < smsize)
-            publishLine2(String(FPSTR(serviceMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(serviceMenu[*currentSelection]), partition);
         }
         else if (key == '<')
         {
           *currentSelection = getPreviousOption(*currentSelection);
           if (*currentSelection < smsize)
-            publishLine2(String(FPSTR(serviceMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(serviceMenu[*currentSelection]), partition);
         }
         else
         {
@@ -587,13 +694,13 @@ void DSCkeybushome::setup()
         {
           *currentSelection = *currentSelection >= umsize ? (umsize - 1) : (*currentSelection > 0 ? *currentSelection - 1 : (umsize - 1));
           if (*currentSelection < umsize)
-            publishLine2(String(FPSTR(userMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(userMenu[*currentSelection]), partition);
         }
         else if (key == '>')
         {
           *currentSelection = *currentSelection >= (umsize - 1) ? 0 : *currentSelection + 1;
           if (*currentSelection < umsize)
-            publishLine2(String(FPSTR(userMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(userMenu[*currentSelection]), partition);
         }
         else if (key == '*' && *currentSelection > 0)
         {
@@ -733,14 +840,14 @@ void DSCkeybushome::setup()
         {
           *currentSelection = *currentSelection >= omsize ? (omsize - 1) : (*currentSelection > 0 ? *currentSelection - 1 : (omsize - 1));
           if (*currentSelection < omsize)
-            publishLine2(String(FPSTR(outputMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(outputMenu[*currentSelection]), partition);
           dsc.write(key, partition);
         }
         else if (key == '>')
         {
           *currentSelection = *currentSelection >= (omsize - 1) ? 0 : *currentSelection + 1;
           if (*currentSelection < omsize)
-            publishLine2(String(FPSTR(outputMenu[*currentSelection])).c_str(), partition);
+            publishLine2(FC(outputMenu[*currentSelection]), partition);
           dsc.write(key, partition);
         }
         else if (key == '*' && *currentSelection > 0)
@@ -804,10 +911,10 @@ void DSCkeybushome::setup()
         ESP_LOGI(TAG, "Writing keys: %s to partition %d, partition disabled: %d , partition locked: %d", keystring.c_str(), partition, dsc.disabled[partition - 1], partitionStatus[partition - 1].locked);
 #else
   if (debug > 0)
-    Serial.printf("Writing keys: %s to partition %d, partition disabled: %d , partition locked: %d\n", keystring.c_str(), partition, dsc.disabled[partition - 1], partitionStatus[partition - 1].locked);
+    Serial.printf("Writing keys: %s to partition %d, partition disabled: %d , partition locked: %d\n", keystring.c_str(), partition, dsc.disabled[partition - 1], partitionStatus[partition - 1].locked); 
 #endif
-      if (dsc.disabled[partition - 1])
-        return;
+     // if (dsc.disabled[partition - 1])
+      //  return;
       partitionStatus[partition - 1].keyPressTime = millis();
       if (keystring.length() == 1)
       {
@@ -830,7 +937,7 @@ void DSCkeybushome::setup()
     void DSCkeybushome::on_json_message(const std::string &topic, JsonObject payload)
     {
       int p = 0;
-      if (topic.find(String(FPSTR(setalarmcommandtopic)).c_str()) != std::string::npos)
+      if (topic.find(setalarmcommandtopic) != std::string::npos)
       {
         if (payload.containsKey("partition"))
           p = payload["partition"];
@@ -948,9 +1055,9 @@ void DSCkeybushome::setup()
       char s1[4];
 
       std::string s = "";
-
-#if !defined(ARDUINO_MQTT)
       char s2[25];
+#if !defined(ARDUINO_MQTT) && defined(USE_TIME)
+    
       ESPTime rtc = now();
       sprintf(s2, "[%02d-%02d-%02d %02d:%02d]", rtc.year, rtc.month, rtc.day_of_month, rtc.hour, rtc.minute);
 #endif
@@ -965,6 +1072,8 @@ void DSCkeybushome::setup()
   ESP_LOGI(label, "%s %02X: %s(%d)", s2, cmd, s.c_str(), dsc.panelBitCount);
 #endif
     }
+
+  
 
     byte DSCkeybushome::getPartitionE6(byte partitionByte)
     {
@@ -996,14 +1105,14 @@ void DSCkeybushome::setup()
               continue;
             if (bitRead(dsc.panelData[panelByte], zoneBit))
             {
-              getZone(zone,true)->partition = partition;
+              getZone(zone,true)->partition = partition; //create zone record if it doesnt exist
               getZone(zone)->enabled = true;
              // if (debug > 1) ESP_LOGD(TAG,"B1: Enabled zone %d on partition %d",zone+1,partition);
             }
             else if (getZone(zone)->partition == partition)
             {
               getZone(zone)->enabled = false;
-              if (debug > 2) ESP_LOGD(TAG,"B1: Disabled zone %d on partition %d",zone+1,partition);
+              //if (debug > 2) ESP_LOGD(TAG,"B1: Disabled zone %d on partition %d",zone+1,partition);
             }
           }
         }
@@ -1029,7 +1138,7 @@ void DSCkeybushome::setup()
               continue;
             if (bitRead(dsc.panelData[panelByte], zoneBit))
             {
-              getZone(zone,true)->partition = partition;
+              getZone(zone,true)->partition = partition; //create zone record if it doesnt exist
               getZone(zone)->enabled = true;
               if (debug > 2) ESP_LOGD(TAG,"E6: Enabled zone %d on partition %d",zone+1,partition);
             }
@@ -1040,11 +1149,12 @@ void DSCkeybushome::setup()
             }
           }
         }
+
       }
       return zonesEnabled;
     }
 
-    String DSCkeybushome::getOptionsString()
+    std::string DSCkeybushome::getOptionsString()
     {
 
       char s1[4];
@@ -1398,64 +1508,7 @@ void DSCkeybushome::setup()
       }
     }
 
-    bool DSCkeybushome::check051bCmd()
-    {
-
-      cmdCountType *cmdCount;
-      static cmdCountType count05;
-      static cmdCountType count1b;
-
-      switch (dsc.panelData[0])
-      {
-      case 0x05:
-        cmdCount = &count05;
-        break;
-      case 0x1b:
-        cmdCount = &count1b;
-        break;
-      default:
-        return true;
-      }
-
-      if (cmdCount->bcount > 0 && cmdCount->bcount != dsc.panelBitCount)
-      {
-        dsc.panelData[11] = 0x77;
-        cmdCount->ecount = cmdCount->ecount + 1;
-        if (cmdCount->ecount > 1)
-        {
-          cmdCount->ccount = 0; // get a new updated bit count since we have more than 1 error count in a row
-          cmdCount->bcount = 0;
-          cmdCount->lbcount = 0;
-          cmdCount->ecount = 0;
-        }
-        return false;
-      }
-      else
-      {
-        cmdCount->ecount = 0; // matching bit count reset error count
-        if (cmdCount->ccount < 3)
-        {
-          if (cmdCount->lbcount == dsc.panelBitCount || cmdCount->lbcount == 0)
-          {
-            cmdCount->ccount = cmdCount->ccount + 1;
-            if (cmdCount->ccount >= 3)
-              cmdCount->bcount = dsc.panelBitCount;
-          }
-          else
-          {
-            dsc.panelData[11] = 0x76;
-            cmdCount->ccount = 0; // reset since we did not get 3 in a row
-            cmdCount->bcount = 0;
-            cmdCount->lbcount = 0;
-            return false;
-          }
-          cmdCount->lbcount = dsc.panelBitCount;
-        }
-      }
-
-      return true;
-    }
-
+    
 #if defined(ARDUINO_MQTT)
 
     void DSCkeybushome::loop()
@@ -1465,25 +1518,55 @@ void DSCkeybushome::update()
 {
 #endif
 
-      if (forceDisconnect)
+      if (forceDisconnect) {
         return;
+      }
 
 #if defined(ESPHOME_MQTT)
       static bool firstrunmqtt = true;
       if (firstrunmqtt && mqtt::global_mqtt_client->is_connected())
       {
-        mqtt::global_mqtt_client->publish(topic, "{\"name\":\"command\", \"cmd_t\":\"" + topic_prefix + String(FPSTR(setalarmcommandtopic)).c_str() + "\"}", 0, 1);
+        mqtt::global_mqtt_client->publish(topic, "{\"name\":\"command\", \"cmd_t\":\"" + topic_prefix + setalarmcommandtopic + "\"}", 0, 1);
         firstrunmqtt = false;
       }
 #endif
+
+
+      if (dsc.firstrun && network::is_connected()) { //wait till network connected before starting dsc isr's
+
+        #ifdef USE_ESP_IDF
+              esp_chip_info_t info;
+              esp_chip_info(&info);
+              ESP_LOGE(TAG, "Cores: %d", info.cores);
+              ESP_LOGE(TAG,"Running on core %d",xPortGetCoreID());
+              uint8_t core = info.cores > 1 ? 1 : 0;
+              TaskHandle_t setupHandle;
+              xTaskCreatePinnedToCore(
+              this->setupTask, // setup task
+              "setupTask",     // Name of the task
+                3000,               // Stack size in words
+              (void *)this,       // Task input parameter
+              10,                 // Priority of the task
+              &setupHandle            // Task handle.
+              ,
+              core // Core where the task should run. If only one core, core will be ignored
+          );
+
+        #else
+              if (dscClockPin && dscReadPin )
+                dsc.begin(dscClockPin, dscReadPin, dscWritePin, invertWrite);
+              else
+                dsc.begin();
+        #endif
+
+      }
+
 
       if (beeps > 0 && millis() - beepTime > 2000)
       {
         beeps = 0;
         for (byte partition = 1; partition <= dscPartitions; partition++)
         {
-          if (dsc.disabled[partition - 1])
-            continue;
           publishBeeps("0", partition);
         }
         beepTime = millis();
@@ -1496,7 +1579,7 @@ void DSCkeybushome::update()
       */
 
       static unsigned long refreshTime;
-      if (!firstrun && refreshTimeSetting > 0 && millis() - refreshTime > refreshTimeSetting)
+      if (dsc.running && refreshTimeSetting > 0 && millis() - refreshTime > refreshTimeSetting)
       {
         refreshTime = millis();
         forceRefresh = true;
@@ -1507,51 +1590,51 @@ void DSCkeybushome::update()
           ESP_LOGD(TAG, "Periodic trouble flag fetch...");
           dsc.write("*2##", defaultPartition); // fetch panel troubles /zone module low battery
         }
-        /*
-    if (debug > 1)   {
-#ifdef ESP32
-      UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-      ESP_LOGD(TAG,"Free memory: %5d,freeheap: %5d,minheap: %5d,maxfree:%5d\n", (uint16_t) uxHighWaterMark,esp_get_free_heap_size(),esp_get_minimum_free_heap_size(),heap_caps_get_largest_free_block(8));
-#endif
-    }
-    */
+
       }
-      //  gptr->call();
-      //&& dsc.panelData[0]
+
       if ((dsc.loop() || forceRefresh))
       { // Processes data only when a valid Keybus command has been read
 
+           if (dsc.bufferOverflow) {
+  
 #if !defined(ARDUINO_MQTT)
-        if (dsc.bufferOverflow)
-        {
+
           ESP_LOGE(TAG, "Keybus buffer overflow");
 #else
-    if (dsc.bufferOverflow)
-    {
-      Serial.printf("Keybus buffer overflow\n");
+        Serial.printf("Keybus buffer overflow\n"); 
 #endif
           dsc.bufferOverflow = false;
         }
+
         static unsigned long errorTime = millis();
+    
         // Checks if the interface is connected to the Keybus
-        if (dsc.keybusChanged || forceRefresh)
+        if ((dsc.keybusChanged) || forceRefresh)
         {
           dsc.keybusChanged = false; // Resets the Keybus data status flag
-          if (dsc.keybusConnected)
+          if (dsc.keybusConnected && millis() - errorTime > 15000)
           {
-            publishSystemStatus(String(FPSTR(STATUS_ONLINE)).c_str());
+            ESP_LOGD(TAG, "Panel keybus connected...");
+            publishSystemStatus(FC(STATUS_ONLINE));
+            errorTime=millis();
           }
           else
           {
+
             if (millis() - errorTime > 15000)
             {
               errorTime = millis();
               ESP_LOGE(TAG, "Panel keybus connect timeout! Is the panel connected?");
-              publishSystemStatus(String(FPSTR(STATUS_OFFLINE)).c_str());
+              publishSystemStatus(FC(STATUS_OFFLINE));
               return;
             }
           }
         }
+
+
+
+
         if (!dsc.panelData[0])
           return; // not valid data
 
@@ -1572,14 +1655,25 @@ void DSCkeybushome::update()
           }
         }
 
-        bool valid05 = check051bCmd();
+     //   bool valid05 = check051bCmd();
+       #if defined(ESP8266) || defined(ESP32)
+  #if defined(USE_ESP_IDF)
+  taskYIELD ();
+  #else
+  yield();
+  #endif
+  #endif
         if (debug > 1)
           printPacket("Panel ", dsc.panelData[0], dsc.panelData, 16);
-        if (!valid05)
-          return;
+        // if (!valid05) {
+        //   if (debug > 1)
+        //     ESP_LOGW(TAG,"Bit count mismatch. Ignoring cmd");
+        //   return;
+        // }
 #ifdef SERIALDEBUGCOMMANDS
         if (debug > 2)
         {
+        #if defined(ARDUINO_MQTT)
           Serial.print(" ");
           dsc.printPanelBinary(); // Optionally prints without spaces: printPanelBinary(false);
           Serial.print(" [");
@@ -1587,6 +1681,15 @@ void DSCkeybushome::update()
           Serial.print("] ");
           dsc.printPanelMessage(); // Prints the decoded message
           Serial.println();
+        #else
+          ESP_LOGD(TAG," ");
+          dsc.printPanelBinary(); // Optionally prints without spaces: printPanelBinary(false);
+          Serial.print(" [");
+          dsc.printPanelCommand(); // Prints the panel command as hex
+          Serial.print("] ");
+          dsc.printPanelMessage(); // Prints the decoded message
+          Serial.println();
+        #endif
         }
 #endif
 
@@ -1594,110 +1697,88 @@ void DSCkeybushome::update()
 
         for (byte partition = 0; partition < dscPartitions; partition++)
         {
-          if (dsc.disabled[partition] || dsc.status[partition] != 0xA0)
+           if ( dsc.status[partition] != 0xA0)
             continue;
           getBypassZones(partition + 1);
           setStatus(partition, true);
         }
-      }
+ 
 
       if (!forceDisconnect && (dsc.statusChanged || forceRefresh) && dsc.panelData[0])
       {                            // Processes data only when a valid Keybus command has been read and statuses were changed
         dsc.statusChanged = false; // Reset the status tracking flag
+ 
 
-        // if (debug  > 0)
-        //  printPacket("Paneldata", dsc.panelData[0], dsc.panelData, 16);
 
-        for (byte partition = 0; partition < dscPartitions; partition++)
-        {
-          if (firstrun)
-          {
-            publishBeeps("0", partition + 1);
-            partitionStatus[partition].chime = 0;
-            for (int x = 1; x <= maxRelays; x++)
-              publishRelayStatus(x, false);
-          }
-          if (dsc.disabled[partition])
-            continue;
-          setStatus(partition, forceRefresh || dsc.status[partition] == 0xEE || dsc.status[partition] == 0xA0);
-        }
 
+        //Main system statuses
         if (dsc.powerChanged || forceRefresh)
         {
           dsc.powerChanged = false;
-          if (dsc.powerTrouble)
-          {
-            publishPanelStatus(ACSTATUS, false, 0); // no ac
-          }
-          else
-          {
-            publishPanelStatus(ACSTATUS, true, 0);
-          }
+          publishPanelStatus(FC(ACSTATUS), !dsc.powerTrouble, 0);
         }
 
         if (dsc.batteryChanged || forceRefresh)
         {
           dsc.batteryChanged = false;
-          if (dsc.batteryTrouble)
-          {
-            publishPanelStatus(BATSTATUS, true, 0);
-          }
-          else
-          {
-            publishPanelStatus(BATSTATUS, false, 0);
-          }
+          publishPanelStatus(FC(BATSTATUS), dsc.batteryTrouble, 0);
         }
 
-        if (dsc.keypadFireAlarm)
-        {
-          dsc.keypadFireAlarm = false;
-          // partitionMsgChangeCallback("Keypad Fire Alarm",defaultPartition);
-        }
+        // if (dsc.keypadFireAlarm)
+        // {
+        //   dsc.keypadFireAlarm = false;
+        //   // partitionMsgChangeCallback("Keypad Fire Alarm",defaultPartition);
+        // }
 
-        if (dsc.keypadPanicAlarm)
-        {
-          dsc.keypadPanicAlarm = false;
-          // partitionMsgChangeCallback("Keypad Panic Alarm",defaultPartition);
-        }
+        // if (dsc.keypadPanicAlarm)
+        // {
+        //   dsc.keypadPanicAlarm = false;
+        //   // partitionMsgChangeCallback("Keypad Panic Alarm",defaultPartition);
+        // }
 
-        // Publishes trouble status
         if (dsc.troubleChanged || forceRefresh)
         {
           dsc.troubleChanged = false; // Resets the trouble status flag
 
-          if (dsc.trouble)
-          {
-            publishPanelStatus(TRSTATUS, true, 0); // Trouble alarm tripped
-          }
-          else
-          {
-            publishPanelStatus(TRSTATUS, false, 0); // Trouble alarm restored
-          }
-          if (!forceRefresh && !partitionStatus[defaultPartition - 1].inprogram && !dsc.armed[defaultPartition - 1] && !dsc.alarm[defaultPartition - 1] && !dsc.disabled[defaultPartition - 1] && !partitionStatus[defaultPartition - 1].locked && troubleFetch)
+          publishPanelStatus(FC(TRSTATUS), dsc.trouble, 0);
+          
+          if (!forceRefresh && !partitionStatus[defaultPartition - 1].inprogram && !dsc.armed[defaultPartition - 1] && !dsc.alarm[defaultPartition - 1] && !dsc.disabled[defaultPartition - 1] && !partitionStatus[defaultPartition - 1].locked && troubleFetch && (millis() - lastTroubleLightTime) > 20000)
           {
             partitionStatus[defaultPartition - 1].keyPressTime = millis();
             ESP_LOGD(TAG, "Fetching troubles..");
             dsc.write(fetchCmd, defaultPartition); // fetch panel troubles /zone module low battery
+            lastTroubleLightTime=millis();
           }
-
-
         }
 
         // Publishes status per partition
         for (byte partition = 0; partition < dscPartitions; partition++)
         {
 
-          if (dsc.disabled[partition] || partitionStatus[partition].locked)
-            continue;
+
+          // if (firstrun)
+          // {
+          //   publishBeeps("0", partition + 1);
+          //   partitionStatus[partition].chime = 0;
+          //   for (int x = 1; x <= maxRelays; x++)
+          //     publishRelayStatus(x, false);
+          // }
+
+          // setStatus(partition, forceRefresh || dsc.status[partition] == 0xEE || dsc.status[partition] == 0xA0);
 
           if (lastStatus[partition] != dsc.status[partition])
           {
             lastStatus[partition] = dsc.status[partition];
             char msg[50];
-            sprintf(msg, PSTR("%02x %s"), dsc.status[partition], String(statusText(dsc.status[partition])).c_str());
+            sprintf(msg, "%02x %s", dsc.status[partition],FC(statusText(dsc.status[partition])));
             publishPartitionMsg(msg, partition + 1);
           }
+           setStatus(partition, forceRefresh || dsc.status[partition] == 0xEE || dsc.status[partition] == 0xA0);
+          // if (partition==0)
+          //   publishPanelStatus(FC(TRSTATUS), bitRead(dsc.lights[partition],4), 0)  //also publish the general tr flag for legacy support
 
+          publishPanelStatus(FC(TRSTATUS), bitRead(dsc.lights[partition],4), partition+1);//trouble light (we have the global one set above but here we can set the per partition light)
+       
           // Publishes alarm status
           if (dsc.alarmChanged[partition] || forceRefresh)
           {
@@ -1710,7 +1791,7 @@ void DSCkeybushome::update()
           }
 
           // Publishes armed/disarmed status
-          // ESP_LOGD("test","partition=%d,armed=%d,armedstay=%d,armedAway=%d,noentrydelay=%d,forced=%d",partition,dsc.armed[partition],dsc.armedStay[partition],dsc.armedAway[partition],dsc.noEntryDelay[partition],forceRefresh);
+        //  ESP_LOGD("test","partition=%d,armed=%d,armedstay=%d,armedAway=%d,noentrydelay=%d,forced=%d",partition+1,dsc.armed[partition],dsc.armedStay[partition],dsc.armedAway[partition],dsc.noEntryDelay[partition],forceRefresh);
           if (dsc.armedChanged[partition] || forceRefresh)
           {
             dsc.armedChanged[partition] = false; // Resets the partition armed status flag
@@ -1718,7 +1799,7 @@ void DSCkeybushome::update()
             if (dsc.armed[partition] && !dsc.alarm[partition])
             {
               clearZoneAlarms(partition + 1);
-              publishPanelStatus(ARMSTATUS, true, partition + 1);
+              publishPanelStatus(FC(ARMSTATUS), true, partition + 1);
             }
             else if (!dsc.exitDelay[partition] && !dsc.alarm[partition])
             {
@@ -1726,7 +1807,7 @@ void DSCkeybushome::update()
               {
                 clearZoneBypass(partition + 1);
               }
-              publishPanelStatus(ARMSTATUS, false, partition + 1);
+              publishPanelStatus(FC(ARMSTATUS), false, partition + 1);
             }
           }
           // Publishes exit delay status
@@ -1741,46 +1822,33 @@ void DSCkeybushome::update()
           if (dsc.readyChanged[partition] || forceRefresh)
           {
             dsc.readyChanged[partition] = false; // Resets the partition alarm status flag
-            if (dsc.ready[partition] && !dsc.exitDelay[partition])
-            {
-              publishPanelStatus(RDYSTATUS, true, partition + 1);
-            }
-            else if (!dsc.exitDelay[partition])
-            {
-              if (!dsc.armed[partition])
-              {
-                publishPanelStatus(RDYSTATUS, false, partition + 1);
-              }
-              publishPanelStatus(RDYSTATUS, false, partition + 1);
-            }
+            publishPanelStatus(FC(RDYSTATUS),dsc.ready[partition], partition + 1);
+            
           }
 
           // Publishes fire alarm status
           if (dsc.fireChanged[partition] || forceRefresh)
           {
             dsc.fireChanged[partition] = false; // Resets the fire status flag
-            if (dsc.fire[partition])
-            {
-              publishFireStatus(true, partition + 1); // Fire alarm tripped
-            }
-            else
-            {
-              publishFireStatus(false, partition + 1); // Fire alarm restored
-            }
+             publishFireStatus(dsc.fire[partition], partition + 1); // Fire alarm restored
           }
+
           if (forceRefresh)
           {
-            publishPanelStatus(CHIMESTATUS, partitionStatus[partition].chime, partition + 1);
+            publishPanelStatus(FC(CHIMESTATUS), partitionStatus[partition].chime, partition + 1);
           }
 
-          const char *status = getPartitionStatus(partition);
-          if (status != NULL && (status != partitionStatus[partition].lastPartitionStatus || forceRefresh))
-          {
-            publishPartitionStatus(String(FPSTR(status)).c_str(), partition + 1);
-          }
+          std::string ps;
+          getPartitionStatus(partition,ps);
+          if (ps!="")
+            publishPartitionStatus(ps.c_str(), partition + 1);
 
-          partitionStatus[partition].lastPartitionStatus = status;
-        }
+
+         // partitionStatus[partition].lastPartitionStatus = status;
+
+        } //for each partition
+
+
 
         // Publishes zones 1-64 status in a separate topic per zone
         // Zone status is stored in the openZones[] and openZonesChanged[] arrays using 1 bit per zone, up to 64 zones:
@@ -1801,7 +1869,7 @@ void DSCkeybushome::update()
                 zone = zoneBit + (zoneGroup * 8);
                 if (zone >= maxZones)
                   continue;
-                zoneType *zt = getZone(zone);
+                sensorObjType *zt = getZone(zone);
                 if (bitRead(dsc.openZones[zoneGroup], zoneBit))
                 {
 
@@ -1814,6 +1882,7 @@ void DSCkeybushome::update()
                 publishZoneStatus(zt);
               }
             }
+
           }
         }
 
@@ -1822,50 +1891,53 @@ void DSCkeybushome::update()
         char s1[7];
         for (auto &x : zoneStatus)
         {
+          if (!x.enabled)
+              continue;
 
           if (x.open)
           {
             if (zoneStatusMsg != "")
-              sprintf(s1, PSTR(",OP:%d"), x.zone);
+              sprintf(s1, FC(",OP:%d"), x.zone);
             else
-              sprintf(s1, PSTR("OP:%d"), x.zone);
+              sprintf(s1, FC("OP:%d"), x.zone);
             zoneStatusMsg.append(s1);
           }
 
           if (x.alarm)
           {
             if (zoneStatusMsg != "")
-              sprintf(s1, PSTR(",AL:%d"), x.zone);
+              sprintf(s1, FC(",AL:%d"), x.zone);
             else
-              sprintf(s1, PSTR("AL:%d"), x.zone);
+              sprintf(s1, FC("AL:%d"), x.zone);
             zoneStatusMsg.append(s1);
           }
           if (x.bypassed)
           {
             if (zoneStatusMsg != "")
-              sprintf(s1, PSTR(",BY:%d"), x.zone);
+              sprintf(s1, FC(",BY:%d"), x.zone);
             else
-              sprintf(s1, PSTR("BY:%d"), x.zone);
+              sprintf(s1, FC("BY:%d"), x.zone);
             zoneStatusMsg.append(s1);
           }
 
           if (x.tamper)
           {
             if (zoneStatusMsg != "")
-              sprintf(s1, PSTR(",TA:%d"), x.zone);
+              sprintf(s1, FC(",TA:%d"), x.zone);
             else
-              sprintf(s1, PSTR("TA:%d"), x.zone);
+              sprintf(s1, FC("TA:%d"), x.zone);
             zoneStatusMsg.append(s1);
           }
 
           if (x.battery_low)
           {
             if (zoneStatusMsg != "")
-              sprintf(s1, PSTR(",LB:%d"), x.zone);
+              sprintf(s1, FC(",LB:%d"), x.zone);
             else
-              sprintf(s1, PSTR("LB:%d"), x.zone);
+              sprintf(s1, FC("LB:%d"), x.zone);
             zoneStatusMsg.append(s1);
           }
+
         }
         // if (zoneStatusMsg == "")
         // zoneStatusMsg = "Pending";
@@ -1888,11 +1960,11 @@ void DSCkeybushome::update()
 
           if (bitRead(system1, 0))
           {
-            system1Msg.append(String(PSTR("BAT ")).c_str());
+            system1Msg.append(FC("BAT "));
             if (system1Changed)
             {
               dsc.batteryTrouble = true;
-              publishPanelStatus(BATSTATUS, true, 0);
+              publishPanelStatus(FC(BATSTATUS), true, 0);
             }
           }
           else
@@ -1900,38 +1972,38 @@ void DSCkeybushome::update()
             if (system1Changed)
             {
               dsc.batteryTrouble = false;
-              publishPanelStatus(BATSTATUS, false, 0);
+              publishPanelStatus(FC(BATSTATUS), false, 0);
             }
           }
 
           if (bitRead(system1, 1))
           {
-            system1Msg.append(String(PSTR("BELL ")).c_str());
+            system1Msg.append(FC("BELL "));
           }
           if (bitRead(system1, 2))
           {
-            system1Msg.append(String(PSTR("SYS ")).c_str());
+            system1Msg.append(FC("SYS "));
           }
           if (bitRead(system1, 3))
           {
-            system1Msg.append(String(PSTR("TAMP ")).c_str());
+            system1Msg.append(FC("TAMP "));
           }
           if (bitRead(system1, 4))
           {
-            system1Msg.append(String(PSTR("SUP ")).c_str());
+            system1Msg.append(FC("SUP "));
           }
           if (bitRead(system1, 5))
           {
-            system1Msg.append(String(PSTR("RF ")).c_str());
+            system1Msg.append(FC("RF "));
           }
           /*
           if (bitRead(system1, 6)) {
-            system1Msg.append(String(PSTR("B4 ")).c_str());
+            system1Msg.append(FC("B4 "));
           }
           if (bitRead(system1, 7)) {
-            system1Msg.append(String(PSTR("A4 ")).c_str());
+            system1Msg.append(FC("A4 "));
           }
-    */
+          */
 
           if (system0Changed)
             previousSystem0 = system0;
@@ -1940,37 +2012,43 @@ void DSCkeybushome::update()
 
           if (bitRead(system0, 1))
           {
-            system0Msg.append(String(PSTR("AC ")).c_str());
+            system0Msg.append(FC("AC "));
           }
           if (bitRead(system0, 2))
           {
-            system0Msg.append(String(PSTR("TEL ")).c_str());
+            system0Msg.append(FC("TEL "));
           }
           if (bitRead(system0, 3))
           {
-            system0Msg.append(String(PSTR("COM ")).c_str());
+            system0Msg.append(FC("COM "));
           }
           if (bitRead(system0, 4))
           {
-            system0Msg.append(String(PSTR("ZF ")).c_str());
+            system0Msg.append(FC("ZF "));
           }
           if (bitRead(system0, 5))
           {
-            system0Msg.append(String(PSTR("ZT ")).c_str());
+            system0Msg.append(FC("ZT "));
           }
           if (bitRead(system0, 6))
           {
-            system0Msg.append(String(PSTR("DBAT ")).c_str());
+            system0Msg.append(FC("DBAT "));
           }
           if (bitRead(system0, 7))
           {
-            system0Msg.append(String(PSTR("TIME ")).c_str());
+            system0Msg.append(FC("TIME "));
           }
           publishTroubleMsgStatus(system0Msg.append(system1Msg));
         }
         system0Changed = false;
         system1Changed = false;
       }
+
+
+      forceRefresh = false;
+     // firstrun = false;
+
+    } //dsc.loop
 
       if (!forceDisconnect && dsc.handleModule() && dsc.moduleCmd)
       {
@@ -1994,57 +2072,67 @@ void DSCkeybushome::update()
               }
               zoneBit++;
             }
+
+
           }
         }
-
+  #if defined(ESP8266) || defined(ESP32)
+  #if defined(USE_ESP_IDF)
+  taskYIELD ();
+  #else
+  yield();
+  #endif
+  #endif
         if (debug > 1)
           printPacket("Module", dsc.moduleCmd, dsc.moduleData, 16);
 
 #ifdef DEBUGCOMMANDS
-        if (debug > 2)
+        if (debug > 2) //esp-idf
         {
-          Serial.print("[MODULE] ");
+          #if defined (ARDUINO_MQTT)
+         Serial.print("[MODULE] ");
           Serial.print(dsc.panelData[0], HEX);
           Serial.print(": ");
           dsc.printModuleBinary(); // Optionally prints without spaces: printKeybusBinary(false);
           Serial.print(" ");
           dsc.printModuleMessage(); // Prints the decoded message
           Serial.println();
+        #endif
+
         }
+          
 #endif
       }
 
-      forceRefresh = false;
-      firstrun = false;
     }
 
-    const char *DSCkeybushome::getPartitionStatus(byte partition)
+     const char * DSCkeybushome::getPartitionStatus(byte partition,std::string & status)
     {
-      const char *status = NULL;
+
+      status="";
       if (dsc.status[partition] == 0x3e)
-        status = STATUS_DISARMED;
+        status = FC(STATUS_DISARMED);
       else if (dsc.alarm[partition])
-        status = STATUS_TRIGGERED;
+        status = FC(STATUS_TRIGGERED);
       else if (dsc.exitDelay[partition])
-        status = STATUS_EXIT;
+       status = FC(STATUS_EXIT);
       else if (dsc.entryDelay[partition])
-        status = STATUS_ENTRY;
+        status = FC(STATUS_ENTRY);
       else if (dsc.noEntryDelay[partition])
-        status = STATUS_NIGHT;
+        status = FC(STATUS_NIGHT);
       else if (dsc.armedStay[partition])
-        status = STATUS_STAY;
+        status = FC(STATUS_STAY);
       else if (dsc.armedAway[partition])
-        status = STATUS_ARM;
+        status = FC(STATUS_ARM);
 #ifdef DETAILED_PARTITION_STATE
       else if (dsc.ready[partition])
-        status = STATUS_READY;
+        status = FC(STATUS_READY);
       else if (dsc.status[partition] != 0x9f && !(dsc.status[partition] > 0x03 && dsc.status[partition] < 0x0e))
-        status = STATUS_NOT_READY;
-#else
-  else
-    status = STATUS_DISARMED;
+        status = FC(STATUS_NOT_READY);
 #endif
-      return status;
+      else
+        status = FC(STATUS_DISARMED);
+      return status.c_str();
     }
 
     void DSCkeybushome::setStatus(byte partition, bool force, bool skip)
@@ -2055,396 +2143,398 @@ void DSCkeybushome::update()
         return;
       byte *currentSelection = &partitionStatus[partition].currentSelection;
       byte *selectedOpenZone = &partitionStatus[partition].selectedZone;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       options = false;
       partitionStatus[partition].digits = 0;
       partitionStatus[partition].hex = false;
       partitionStatus[partition].decimalInput = false;
 #if !defined(ARDUINO_MQTT)
-      if (debug > 1)
+      if (debug > 1 &&  dsc.status[partition] != partitionStatus[partition].lastStatus ) {
         ESP_LOGI(TAG, "status %02X, last status %02X,selection %02X,partition=%d,skip=%d,force=%d", dsc.status[partition], partitionStatus[partition].lastStatus, *currentSelection, partition + 1, skip, force);
-#else
-  if (debug > 1)
-    Serial.printf("status %02X, last status %02X,selection %02X,partition=%d,skip=%d,force=%d\n", dsc.status[partition], partitionStatus[partition].lastStatus, *currentSelection, partition + 1, skip, force);
-#endif
+      }
+        #else
+  if (debug > 1 &&  dsc.status[partition] != partitionStatus[partition].lastStatus ) {
+    Serial.printf("status %02X, last status %02X,selection %02X,partition=%d,skip=%d,force=%d\n", dsc.status[partition], partitionStatus[partition].lastStatus, *currentSelection, partition + 1, skip, force); 
+    }
+    #endif
       switch (dsc.status[partition])
       {
       case 0x01:
-        lcdLine1 = F("Partition ready");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Partition ready");
+        lcdLine2 = FCS(" ");
         break;
       case 0x02:
-        lcdLine1 = F("Stay");
-        lcdLine2 = F("zones open");
+        lcdLine1 = FCS("Stay");
+        lcdLine2 = FCS("zones open");
         break;
       case 0x03:
-        lcdLine1 = F("Zones open  <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Zones open  <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0x04:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Stay");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Stay");
         break;
       case 0x05:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Away");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Away");
         break;
       case 0x06:
-        lcdLine1 = F("Armed Stay");
-        lcdLine2 = F("No entry delay");
+        lcdLine1 = FCS("Armed Stay");
+        lcdLine2 = FCS("No entry delay");
         break;
       case 0x07:
-        lcdLine1 = F("Failed");
-        lcdLine2 = F("to arm");
+        lcdLine1 = FCS("Failed");
+        lcdLine2 = FCS("to arm");
         break;
       case 0x08:
-        lcdLine1 = F("Exit delay");
-        lcdLine2 = F("in progress");
+        lcdLine1 = FCS("Exit delay");
+        lcdLine2 = FCS("in progress");
         break;
       case 0x09:
-        lcdLine1 = F("Arming");
-        lcdLine2 = F("No entry delay");
+        lcdLine1 = FCS("Arming");
+        lcdLine2 = FCS("No entry delay");
         break;
       case 0x0B:
-        lcdLine1 = F("Quick exit");
-        lcdLine2 = F("in progress");
+        lcdLine1 = FCS("Quick exit");
+        lcdLine2 = FCS("in progress");
         break;
       case 0x0C:
-        lcdLine1 = F("Entry delay");
-        lcdLine2 = F("in progress");
+        lcdLine1 = FCS("Entry delay");
+        lcdLine2 = FCS("in progress");
         break;
       case 0x0D:
-        lcdLine1 = F("Entry delay");
-        lcdLine2 = F("after alarm");
+        lcdLine1 = FCS("Entry delay");
+        lcdLine2 = FCS("after alarm");
         break;
       case 0x0E:
-        lcdLine1 = F("Not");
-        lcdLine2 = F("available");
+        lcdLine1 = FCS("Not");
+        lcdLine2 = FCS("available");
         break;
       case 0x10:
-        lcdLine1 = F("Keypad");
-        lcdLine2 = F("lockout");
+        lcdLine1 = FCS("Keypad");
+        lcdLine2 = FCS("lockout");
         break;
       case 0x11:
-        lcdLine1 = F("Partition in alarm");
-        lcdLine2 = F("  ");
+        lcdLine1 = FCS("Partition in alarm");
+        lcdLine2 = FCS("  ");
         break;
       case 0x12:
-        lcdLine1 = F("Battery check");
-        lcdLine2 = F("in progress");
+        lcdLine1 = FCS("Battery check");
+        lcdLine2 = FCS("in progress");
         break;
       case 0x14:
-        lcdLine1 = F("Auto-arm");
-        lcdLine2 = F("in progress");
+        lcdLine1 = FCS("Auto-arm");
+        lcdLine2 = FCS("in progress");
         break;
       case 0x15:
-        lcdLine1 = F("Arming with");
-        lcdLine2 = F("bypass zones");
+        lcdLine1 = FCS("Arming with");
+        lcdLine2 = FCS("bypass zones");
         break;
       case 0x16:
-        lcdLine1 = F("Armed away");
-        lcdLine2 = F("No entry delay");
+        lcdLine1 = FCS("Armed away");
+        lcdLine2 = FCS("No entry delay");
         break;
       case 0x17:
-        lcdLine1 = F("Keypad blanked");
-        lcdLine2 = F("Enter access code");
+        lcdLine1 = FCS("Keypad blanked");
+        lcdLine2 = FCS("Enter access code");
         break;
       case 0x19:
-        lcdLine1 = F("Alarm");
-        lcdLine2 = F("occurred");
+        lcdLine1 = FCS("Alarm");
+        lcdLine2 = FCS("occurred");
         break;
       case 0x22:
-        lcdLine1 = F("Alarms occurred");
-        lcdLine2 = F("Press # to exit");
+        lcdLine1 = FCS("Alarms occurred");
+        lcdLine2 = FCS("Press # to exit");
         break;
       case 0x2F:
-        lcdLine1 = F("Keypad LCD");
-        lcdLine2 = F("test");
+        lcdLine1 = FCS("Keypad LCD");
+        lcdLine2 = FCS("test");
         break;
       case 0x33:
-        lcdLine1 = F("Command");
-        lcdLine2 = F("output active");
+        lcdLine1 = FCS("Command");
+        lcdLine2 = FCS("output active");
         break;
       case 0x3D:
-        lcdLine1 = F("Alarm");
-        lcdLine2 = F("occurred");
+        lcdLine1 = FCS("Alarm");
+        lcdLine2 = FCS("occurred");
         break;
       case 0x3E:
-        lcdLine1 = F("Disarmed");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Disarmed");
+        lcdLine2 = FCS(" ");
         break;
       case 0x40:
-        lcdLine1 = F("Keypad blanked");
-        lcdLine2 = F("Enter access code");
+        lcdLine1 = FCS("Keypad blanked");
+        lcdLine2 = FCS("Enter access code");
         break;
       case 0x80:
-        lcdLine1 = F("Invalid entry");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Invalid entry");
+        lcdLine2 = FCS(" ");
         break;
       case 0x8A:
-        lcdLine1 = F("Activate");
-        lcdLine2 = F("stay/away zones ");
+        lcdLine1 = FCS("Activate");
+        lcdLine2 = FCS("stay/away zones ");
         break;
       case 0x8B:
-        lcdLine1 = F("Quick exit");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Quick exit");
+        lcdLine2 = FCS(" ");
         break;
       case 0x8E:
-        lcdLine1 = F("Invalid");
-        lcdLine2 = F("option");
+        lcdLine1 = FCS("Invalid");
+        lcdLine2 = FCS("option");
         break;
       case 0x8F:
-        lcdLine1 = F("Invalid");
-        lcdLine2 = F("Access_code");
+        lcdLine1 = FCS("Invalid");
+        lcdLine2 = FCS("Access_code");
         break;
       case 0x9E:
-        lcdLine1 = F("Press (*) for <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Press (*) for <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0x9F:
-        lcdLine1 = F("Enter");
-        lcdLine2 = F("Access_code");
+        lcdLine1 = FCS("Enter");
+        lcdLine2 = FCS("Access_code");
         break;
       case 0xA0:
-        lcdLine1 = F("Zone bypass <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Zone bypass <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xA1:
-        lcdLine1 = F("Trouble menu <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Trouble menu <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xA2:
-        lcdLine1 = F("Alarm memory <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Alarm memory <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xA3:
-        lcdLine1 = F("Door");
-        lcdLine2 = F("chime enabled");
+        lcdLine1 = FCS("Door");
+        lcdLine2 = FCS("chime enabled");
         partitionStatus[partition].chime = true;
-        publishPanelStatus(CHIMESTATUS, true, partition + 1);
+        publishPanelStatus(FC(CHIMESTATUS), true, partition + 1);
         break;
       case 0xA4:
-        lcdLine1 = F("Door");
-        lcdLine2 = F("chime disabled  ");
+        lcdLine1 = FCS("Door");
+        lcdLine2 = FCS("chime disabled  ");
         partitionStatus[partition].chime = false;
-        publishPanelStatus(CHIMESTATUS, false, partition + 1);
+        publishPanelStatus(FC(CHIMESTATUS), false, partition + 1);
         break;
       case 0xA5:
-        lcdLine1 = F("Enter");
-        lcdLine2 = F("Master code");
+        lcdLine1 = FCS("Enter");
+        lcdLine2 = FCS("Master code");
         break;
       case 0xA6:
-        lcdLine1 = F("*5:  Access code");
-        lcdLine2 = F("code? (2 digits)");
+        lcdLine1 = FCS("*5:  Access code");
+        lcdLine2 = FCS("code? (2 digits)");
         // digits = 2;
         break;
       case 0xA7:
-        lcdLine1 = F("*5 Enter new");
-        lcdLine2 = F("4-digit code");
+        lcdLine1 = FCS("*5 Enter new");
+        lcdLine2 = FCS("4-digit code");
         partitionStatus[partition].digits = 4;
         break;
       case 0xA9:
-        lcdLine1 = F("*6: User functions");
-        lcdLine2 = F("function?");
+        lcdLine1 = FCS("*6: User functions");
+        lcdLine2 = FCS("function?");
         break;
       case 0xAA:
-        lcdLine1 = F(" HHMM    MMDDYY");
-        lcdLine2 = F("");
+        lcdLine1 = FCS(" HHMM    MMDDYY");
+        lcdLine2 = "";
         partitionStatus[partition].digits = 16;
         break;
       case 0xAB:
-        lcdLine1 = F(" HHMM");
-        lcdLine2 = F("");
+        lcdLine1 = FCS(" HHMM");
+        lcdLine2 = "";
         partitionStatus[partition].digits = 4;
         break;
       case 0xAC:
-        lcdLine1 = F("*6");
-        lcdLine2 = F("Auto-arm on");
+        lcdLine1 = FCS("*6");
+        lcdLine2 = FCS("Auto-arm on");
         break;
       case 0xAD:
-        lcdLine1 = F("*6");
-        lcdLine2 = F("Auto-arm off");
+        lcdLine1 = FCS("*6");
+        lcdLine2 = FCS("Auto-arm off");
         break;
       case 0xAF:
-        lcdLine1 = F("*6");
-        lcdLine2 = F("System test");
+        lcdLine1 = FCS("*6");
+        lcdLine2 = FCS("System test");
         break;
       case 0xB0:
-        lcdLine1 = F("*6");
-        lcdLine2 = F("Enable DLS");
+        lcdLine1 = FCS("*6");
+        lcdLine2 = FCS("Enable DLS");
         break;
       case 0xB1:
-        lcdLine1 = F("*6");
-        lcdLine2 = F("b1 command");
+        lcdLine1 = FCS("*6");
+        lcdLine2 = FCS("b1 command");
         break;
       case 0xB2:
       case 0xB3:
-        lcdLine1 = F("*7");
-        lcdLine2 = F("Command output");
+        lcdLine1 = FCS("*7");
+        lcdLine2 = FCS("Command output");
         break;
       case 0xB7:
-        lcdLine1 = F("Enter");
-        lcdLine2 = F("installer code");
+        lcdLine1 = FCS("Enter");
+        lcdLine2 = FCS("installer code");
         break;
       case 0xB8:
-        lcdLine1 = F("Enter *");
-        lcdLine2 = F("function code");
+        lcdLine1 = FCS("Enter *");
+        lcdLine2 = FCS("function code");
         break;
       case 0xB9:
-        lcdLine1 = F("Zone Tamper <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Zone Tamper <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xBA:
-        lcdLine1 = F("Zones low battery <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Zones low battery <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xBC:
-        lcdLine1 = F("*5 Enter new");
-        lcdLine2 = F("6-digit code");
+        lcdLine1 = FCS("*5 Enter new");
+        lcdLine2 = FCS("6-digit code");
         partitionStatus[partition].digits = 6;
         break;
       case 0xBF:
-        lcdLine1 = F("Select day:");
-        lcdLine2 = F("Sun=1,Tue=2,Sat=7");
+        lcdLine1 = FCS("Select day:");
+        lcdLine2 = FCS("Sun=1,Tue=2,Sat=7");
         break;
       case 0xC6:
-        lcdLine1 = F(" Zone faults  <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS(" Zone faults  <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xC7:
-        lcdLine1 = F("Partition");
-        lcdLine2 = F("disabled        ");
+        lcdLine1 = FCS("Partition");
+        lcdLine2 = FCS("disabled        ");
         break;
       case 0xC8:
-        lcdLine1 = F("Service req. <>");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Service req. <>");
+        lcdLine2 = FCS(" ");
         break;
       case 0xCD:
-        lcdLine1 = F("Downloading in progress");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Downloading in progress");
+        lcdLine2 = FCS(" ");
         break;
       case 0xCE:
-        lcdLine1 = F("Active camera");
-        lcdLine2 = F("monitor select. ");
+        lcdLine1 = FCS("Active camera");
+        lcdLine2 = FCS("monitor select. ");
         break;
       case 0xD0:
-        lcdLine1 = F("*2: Keypads");
-        lcdLine2 = F("low battery");
+        lcdLine1 = FCS("*2: Keypads");
+        lcdLine2 = FCS("low battery");
         break;
       case 0xD1:
-        lcdLine1 = F("*2: Keyfobs");
-        lcdLine2 = F("low battery");
+        lcdLine1 = FCS("*2: Keyfobs");
+        lcdLine2 = FCS("low battery");
         break;
       case 0xD4:
-        lcdLine1 = F("*2: Sensors");
-        lcdLine2 = F("RF Delinquency");
+        lcdLine1 = FCS("*2: Sensors");
+        lcdLine2 = FCS("RF Delinquency");
         break;
       case 0xE4:
-        lcdLine1 = F("Section:");
-        lcdLine2 = F("(3 digits)");
+        lcdLine1 = FCS("Section:");
+        lcdLine2 = FCS("(3 digits)");
         break;
       case 0xE5:
-        lcdLine1 = F("Keypad");
-        lcdLine2 = F("slot assignmen");
+        lcdLine1 = FCS("Keypad");
+        lcdLine2 = FCS("slot assignmen");
         break;
       case 0xE6:
-        lcdLine1 = F("Input:");
-        lcdLine2 = F("(2 digits)");
+        lcdLine1 = FCS("Input:");
+        lcdLine2 = FCS("(2 digits)");
         partitionStatus[partition].digits = 2;
         break;
       case 0xE7:
-        lcdLine1 = F("Input:");
+        lcdLine1 = FCS("Input:");
         partitionStatus[partition].digits = 3;
-        lcdLine2 = F("(3 digits)");
+        lcdLine2 = FCS("(3 digits)");
         partitionStatus[partition].decimalInput = true;
         break;
       case 0xE8:
-        lcdLine1 = F("Input:");
+        lcdLine1 = FCS("Input:");
         partitionStatus[partition].digits = 4;
-        lcdLine2 = F("(4 digits)");
+        lcdLine2 = FCS("(4 digits)");
         break;
       case 0xE9:
-        lcdLine1 = F("Input:");
+        lcdLine1 = FCS("Input:");
         partitionStatus[partition].digits = 5;
-        lcdLine2 = F("(5 digits)");
+        lcdLine2 = FCS("(5 digits)");
         break;
       case 0xEA:
-        lcdLine1 = F("Input hex:");
+        lcdLine1 = FCS("Input hex:");
         partitionStatus[partition].digits = 2;
         partitionStatus[partition].hex = true;
-        lcdLine2 = F("(2 digits)");
+        lcdLine2 = FCS("(2 digits)");
         break;
       case 0xEB:
-        lcdLine1 = F("Input hex:");
+        lcdLine1 = FCS("Input hex:");
         partitionStatus[partition].digits = 4;
         partitionStatus[partition].hex = true;
-        lcdLine2 = F("(4 digits)");
+        lcdLine2 = FCS("(4 digits)");
         break;
       case 0xEC:
-        lcdLine1 = F("Input hex:");
+        lcdLine1 = FCS("Input hex:");
         partitionStatus[partition].digits = 6;
         partitionStatus[partition].hex = true;
-        lcdLine2 = F("(6 digits)");
+        lcdLine2 = FCS("(6 digits)");
         break;
       case 0xED:
-        lcdLine1 = F("Input hex:");
+        lcdLine1 = FCS("Input hex:");
         partitionStatus[partition].digits = 32;
         partitionStatus[partition].hex = true;
-        lcdLine2 = F("(32 digits)  ");
+        lcdLine2 = FCS("(32 digits)  ");
         break;
       case 0xEE:
-        lcdLine1 = F("options:");
+        lcdLine1 = FCS("options:");
         options = true;
-        lcdLine2 = F("option per zone ");
+        lcdLine2 = FCS("option per zone ");
         break;
       case 0xEF:
-        lcdLine1 = F("Module");
-        lcdLine2 = F("supervision");
+        lcdLine1 = FCS("Module");
+        lcdLine2 = FCS("supervision");
         break;
       case 0xF0:
-        lcdLine1 = F("Function");
-        lcdLine2 = F("key 1");
+        lcdLine1 = FCS("Function");
+        lcdLine2 = FCS("key 1");
         break;
       case 0xF1:
-        lcdLine1 = F("Function");
-        lcdLine2 = F("key 2");
+        lcdLine1 = FCS("Function");
+        lcdLine2 = FCS("key 2");
         break;
       case 0xF2:
-        lcdLine1 = F("Function");
-        lcdLine2 = F("key 3");
+        lcdLine1 = FCS("Function");
+        lcdLine2 = FCS("key 3");
         break;
       case 0xF3:
-        lcdLine1 = F("Function");
-        lcdLine2 = F("key 4");
+        lcdLine1 = FCS("Function");
+        lcdLine2 = FCS("key 4");
         break;
       case 0xF4:
-        lcdLine1 = F("Function");
-        lcdLine2 = F("key 5");
+        lcdLine1 = FCS("Function");
+        lcdLine2 = FCS("key 5");
         break;
       case 0xF5:
-        lcdLine1 = F("Wireless mod.");
-        lcdLine2 = F("placement test");
+        lcdLine1 = FCS("Wireless mod.");
+        lcdLine2 = FCS("placement test");
         break;
       case 0xF6:
-        lcdLine1 = F("Activate");
-        lcdLine2 = F("device for test");
+        lcdLine1 = FCS("Activate");
+        lcdLine2 = FCS("device for test");
         break;
       case 0xF7:
-        lcdLine1 = F("Sub-section:");
-        lcdLine2 = F("(2 digits)");
+        lcdLine1 = FCS("Sub-section:");
+        lcdLine2 = FCS("(2 digits)");
         break;
       case 0xF8:
-        lcdLine1 = F("Keypad");
-        lcdLine2 = F("programming");
+        lcdLine1 = FCS("Keypad");
+        lcdLine2 = FCS("programming");
         break;
       case 0xFA:
-        lcdLine1 = F("Input:");
+        lcdLine1 = FCS("Input:");
         partitionStatus[partition].digits = 6;
-        lcdLine2 = F("(6 digits) ");
+        lcdLine2 = FCS("(6 digits) ");
         break;
       default:
-        lcdLine2 = dsc.status[partition];
+        lcdLine2 = std::to_string(dsc.status[partition]);
         partitionStatus[partition].digits = 0;
       }
 
@@ -2491,8 +2581,8 @@ void DSCkeybushome::update()
           partitionStatus[partition].editIdx = 0;
           partitionStatus[partition].hexMode = false;
           partitionStatus[partition].newData = true;
-          lcdLine1 = F("");
-          lcdLine2 = F("");
+          lcdLine1 = FC("");
+          lcdLine2 = FC("");
 
           // ok, we should have the data now so display it
         }
@@ -2505,14 +2595,14 @@ void DSCkeybushome::update()
           int y;
           char c;
           if (partitionStatus[partition].hexMode)
-            lcdLine1 = F("*");
+            lcdLine1 = FC("*");
 
           if (partitionStatus[partition].decimalInput)
           {
             if (partitionStatus[partition].digits == 2)
-              sprintf(decimalInputBuffer, PSTR("%2d"), dsc.pgmBuffer.data[0]);
+              sprintf(decimalInputBuffer, FC("%2d"), dsc.pgmBuffer.data[0]);
             else
-              sprintf(decimalInputBuffer, PSTR("%03d"), dsc.pgmBuffer.data[0]);
+              sprintf(decimalInputBuffer, FC("%03d"), dsc.pgmBuffer.data[0]);
           }
           for (int x = 0; x < partitionStatus[partition].digits; x++)
           {
@@ -2521,22 +2611,22 @@ void DSCkeybushome::update()
               c = decimalInputBuffer[x] - 48;
             else
               c = x % 2 ? dsc.pgmBuffer.data[y] & 0x0F : (dsc.pgmBuffer.data[y] & 0xF0) >> 4;
-            String tpl = F("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+            std::string tpl = FCS("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
 
             if (dsc.status[partition] == 0xAA)
             {
-              tpl = F("XXXX    XXXXXX  XXXXXXXXXXXXXXXX");
+              tpl = FCS("XXXX    XXXXXX  XXXXXXXXXXXXXXXX");
             }
             if (dsc.status[partition] == 0xAB)
             {
-              tpl = F("XXXX");
+              tpl = FCS("XXXX");
             }
             if (tpl[x] == 'X')
             {
               if (x == partitionStatus[partition].editIdx)
-                sprintf(s, PSTR("[%1X]"), c);
+                sprintf(s, FC("[%1X]"), c);
               else
-                sprintf(s, PSTR("%1X"), c);
+                sprintf(s, FC("%1X"), c);
             }
             else
               sprintf(s, " ");
@@ -2562,18 +2652,18 @@ void DSCkeybushome::update()
         { // status menu/open zones
           if (*currentSelection > 1 && *currentSelection < amsize)
           {
-            std::string s = String(FPSTR(statusMenu[*currentSelection])).c_str();
+            std::string s = FC(statusMenu[*currentSelection]);
             int pos = s.find(":");
-            lcdLine1 = (s.substr(0, pos)).c_str();
-            lcdLine2 = (s.substr(pos + 1)).c_str();
+            lcdLine1 = s.substr(0, pos);
+            lcdLine2 = s.substr(pos + 1);
           }
           else
           {
             byte c = dsc.ready[partition] ? 0 : 1;
-            std::string s = String(FPSTR(statusMenuLabels[c])).c_str();
+            std::string s = FC(statusMenuLabels[c]);
             int pos = s.find(":");
-            lcdLine1 = (s.substr(0, pos)).c_str();
-            lcdLine2 = (s.substr(pos + 1)).c_str();
+            lcdLine1 = s.substr(0, pos);
+            lcdLine2 = s.substr(pos + 1);
             *currentSelection = 1;
           }
           if (*selectedOpenZone && *selectedOpenZone < maxZones)
@@ -2582,9 +2672,9 @@ void DSCkeybushome::update()
             std::string name = getZoneName(*selectedOpenZone);
 
             if (name != "")
-              snprintf(s, 50, PSTR("%02d %s"), *selectedOpenZone, name.c_str());
+              snprintf(s, 50, FC("%02d %s"), *selectedOpenZone, name.c_str());
             else
-              snprintf(s, 50, PSTR("%02d"), *selectedOpenZone);
+              snprintf(s, 50, FC("%02d"), *selectedOpenZone);
             lcdLine2 = s;
           }
         }
@@ -2603,13 +2693,13 @@ void DSCkeybushome::update()
             std::string name = getZoneName(*currentSelection);
             if (name != "")
                 if (bypassStatus==' ')
-                  snprintf(s, 50, PSTR("%02d %s"), *currentSelection, name.c_str());
+                  snprintf(s, 50, FC("%02d %s"), *currentSelection, name.c_str());
                 else
-                  snprintf(s, 50, PSTR("%02d %s %c"), *currentSelection, name.c_str(), bypassStatus);
+                  snprintf(s, 50, FC("%02d %s %c"), *currentSelection, name.c_str(), bypassStatus);
             else if (bypassStatus==' ')
-                snprintf(s, 50, PSTR("%02d"), *currentSelection);
+                snprintf(s, 50, FC("%02d"), *currentSelection);
               else
-                snprintf(s, 50, PSTR("%02d %c"), *currentSelection, bypassStatus);
+                snprintf(s, 50, FC("%02d %c"), *currentSelection, bypassStatus);
             lcdLine2 = s;
           }
         }
@@ -2622,9 +2712,9 @@ void DSCkeybushome::update()
             char s[51];
             std::string name = getZoneName(*currentSelection);
             if (name != "")
-              snprintf(s, 50, PSTR("%02d %s"), *currentSelection, name.c_str());
+              snprintf(s, 50, FC("%02d %s"), *currentSelection, name.c_str());
             else
-              snprintf(s, 50, PSTR("%02d "), *currentSelection);
+              snprintf(s, 50, FC("%02d "), *currentSelection);
             lcdLine2 = s;
           }
           else
@@ -2639,16 +2729,16 @@ void DSCkeybushome::update()
             char s[51];
             std::string name = getZoneName(*currentSelection);
             if (name != "")
-              snprintf(s, 50, PSTR("%02d (%s)"), *currentSelection, name.c_str());
+              snprintf(s, 50, FC("%02d (%s)"), *currentSelection, name.c_str());
             else
-              snprintf(s, 50, PSTR("%02d"), *currentSelection);
+              snprintf(s, 50, FC("%02d"), *currentSelection);
 
             lcdLine2 = s;
           }
           else if (!force)
           {
-            lcdLine1 = F("No alarms");
-            lcdLine2 = F("in memory");
+            lcdLine1 = FCS("No alarms");
+            lcdLine2 = FCS("in memory");
           }
         }
         else if (dsc.status[partition] == 0xBA)
@@ -2661,16 +2751,16 @@ void DSCkeybushome::update()
             char s[51];
             std::string name = getZoneName(*currentSelection);
             if (name != "")
-              snprintf(s, 50, PSTR("%02d (%s)"), *currentSelection, name.c_str());
+              snprintf(s, 50, FC("%02d (%s)"), *currentSelection, name.c_str());
             else
-              snprintf(s, 50, PSTR("%02d"), *currentSelection);
+              snprintf(s, 50, FC("%02d"), *currentSelection);
 
             lcdLine2 = s;
           }
           else
           {
-            lcdLine1 = F("There are no");
-            lcdLine2 = F("low battery zones");
+            lcdLine1 = FCS("There are no");
+            lcdLine2 = FCS("low battery zones");
           }
         }
         else if (dsc.status[partition] == 0x9E)
@@ -2680,7 +2770,7 @@ void DSCkeybushome::update()
             *currentSelection = 1;
           }
           if (*currentSelection < mmsize)
-            lcdLine2 = String(FPSTR(mainMenu[*currentSelection]));
+            lcdLine2 =FC(mainMenu[*currentSelection]);
         }
         else if (dsc.status[partition] == 0xB2)
         { // output menu
@@ -2689,7 +2779,7 @@ void DSCkeybushome::update()
             *currentSelection = 1;
           }
           if (*currentSelection < omsize)
-            lcdLine2 = String(FPSTR(outputMenu[*currentSelection]));
+            lcdLine2 = FC(outputMenu[*currentSelection]);
         }
         else if (dsc.status[partition] == 0xA9 && !partitionStatus[partition].eventViewer)
         { // user menu
@@ -2698,7 +2788,7 @@ void DSCkeybushome::update()
             *currentSelection = 1;
           }
           if (*currentSelection < umsize)
-            lcdLine2 = String(FPSTR(userMenu[*currentSelection]));
+            lcdLine2 = FC(userMenu[*currentSelection]);
         }
         else if (dsc.status[partition] == 0xA1)
         { // trouble
@@ -2708,7 +2798,7 @@ void DSCkeybushome::update()
           }
           if (*currentSelection < tmsize)
           {
-            lcdLine2 = String(FPSTR(troubleMenu[*currentSelection]));
+            lcdLine2 = FC(troubleMenu[*currentSelection]);
           }
         }
         else if (dsc.status[partition] == 0xC8)
@@ -2718,7 +2808,7 @@ void DSCkeybushome::update()
             *currentSelection = getNextOption(0);
           if (*currentSelection < smsize)
           {
-            lcdLine2 = String(FPSTR(serviceMenu[*currentSelection]));
+            lcdLine2 = FC(serviceMenu[*currentSelection]);
           }
         }
         else if (dsc.status[partition] == 0xA6)
@@ -2733,9 +2823,9 @@ void DSCkeybushome::update()
               programmed = 'P';
             std::string name = getUserName(*currentSelection);
             if (name != "")
-              snprintf(s, 50, PSTR("%02d (%s)   %c"), *currentSelection, name.c_str(), programmed);
+              snprintf(s, 50, FC("%02d (%s)   %c"), *currentSelection, name.c_str(), programmed);
             else
-              snprintf(s, 50, PSTR("%02d   %c"), *currentSelection, programmed);
+              snprintf(s, 50, FC("%02d   %c"), *currentSelection, programmed);
             lcdLine2 = s;
           }
         }
@@ -2808,8 +2898,10 @@ void DSCkeybushome::update()
         printPanel_0x6E();
         break;
       case 0x69:
+          processBeeps(2,1); //partition 2
+          break;
       case 0x64:
-        printBeeps(2);
+        processBeeps(2,0); //partition 1
         break;
       case 0x75: // tones 1
       case 0x7D:
@@ -2840,7 +2932,7 @@ void DSCkeybushome::update()
         case 0x1D: // ESP_LOGI(TAG, "Sent tones cmd %02X,%02X", dsc.panelData[0], dsc.panelData[4]);
           break;   // tones 3-8
         case 0x19:
-          printBeeps(4);
+          processBeeps19(4,3);
           break;
         case 0x1A:
           break;
@@ -2868,10 +2960,10 @@ void DSCkeybushome::update()
           switch (dsc.panelData[8])
           {
           case 0xAE:
-            publishLine2(String(F("Walk test end")).c_str(), activePartition);
+            publishLine2(FC("Walk test end"), activePartition);
             break;
           case 0xAF:
-            publishLine2(String(F("Walk test beging")).c_str(), activePartition);
+            publishLine2(FC("Walk test begin"), activePartition);
             break;
           };
         processEventBufferEC(true);
@@ -2882,7 +2974,7 @@ void DSCkeybushome::update()
       }
     }
 
-    void DSCkeybushome::printPanelTone(byte panelByte)
+    void DSCkeybushome::processPanelTone(byte panelByte)
     {
 
       if (dsc.panelData[panelByte] == 0)
@@ -2910,16 +3002,12 @@ void DSCkeybushome::update()
       }
     }
 
-    void DSCkeybushome::printBeeps(byte panelByte)
+    void DSCkeybushome::processBeeps(byte beepByte,byte partition)
     {
       dsc.statusChanged = true;
-      beeps = dsc.panelData[panelByte] / 2;
+      beeps = dsc.panelData[beepByte] / 2;
       char s[4];
       sprintf(s, "%d", beeps);
-      for (byte partition = 0; partition < dscPartitions; partition++)
-      {
-        if (dsc.disabled[partition] || partitionStatus[partition].locked)
-          continue;
         publishBeeps(s, partition + 1);
         if (beeps == 2 && partitionStatus[partition].digits)
         {
@@ -2928,7 +3016,32 @@ void DSCkeybushome::update()
           partitionStatus[partition].hexMode = false;
           partitionStatus[partition].newData = true;
         }
+
+      beepTime = millis();
+    }
+
+    void DSCkeybushome::processBeeps19(byte beepByte,byte partitionByte)
+    {
+      dsc.statusChanged = true;
+      beeps = dsc.panelData[beepByte] / 2;
+      char s[4];
+      sprintf(s, "%d", beeps);
+      byte bitCount = 0;
+      for (byte bit = 0; bit <= 7; bit++) {
+       if (bitRead(dsc.panelData[partitionByte], bit)) {
+        byte partition=bitCount;
+        publishBeeps(s,partition+1);
+        if (beeps == 2 && partitionStatus[partition].digits)
+        {
+          dsc.setLCDReceive(partitionStatus[partition].digits, partition);
+          partitionStatus[partition].editIdx = 0;
+          partitionStatus[partition].hexMode = false;
+          partitionStatus[partition].newData = true;
+        }
+
       }
+      bitCount++;
+     }
       beepTime = millis();
     }
 
@@ -3013,8 +3126,7 @@ void DSCkeybushome::update()
         }
       }
 
-      if (options)
-        dsc.statusChanged = true;
+      dsc.statusChanged = true;
     }
 
     void DSCkeybushome::processEventBufferAA(bool showEvent)
@@ -3028,17 +3140,17 @@ void DSCkeybushome::update()
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
-        strcat_P(eventInfo, PSTR("'time':'"));
+        strcat_P(eventInfo, FC("'time':'"));
 #else
-        strcat_P(eventInfo, PSTR("["));
+        strcat_P(eventInfo, FC("["));
 #endif
       }
       if (!showEvent)
       {
-        strcat_P(eventInfo, PSTR("E:"));
+        strcat_P(eventInfo, FC("E:"));
         itoa(dsc.panelData[7], charBuffer, 10);
         if (dsc.panelData[7] < 10)
-          strcat_P(eventInfo, PSTR("00"));
+          strcat_P(eventInfo, FC("00"));
         else if (dsc.panelData[7] < 100)
           strcat(eventInfo, "0");
         strcat(eventInfo, charBuffer);
@@ -3056,9 +3168,9 @@ void DSCkeybushome::update()
       byte dscMinute = dsc.panelData[2 + 3] >> 2;
 
       if (dscYear3 >= 7)
-        strcat_P(eventInfo, PSTR("19"));
+        strcat_P(eventInfo, FC("19"));
       else
-        strcat_P(eventInfo, PSTR("20"));
+        strcat_P(eventInfo, FC("20"));
       itoa(dscYear3, charBuffer, 10);
       strcat(eventInfo, charBuffer);
       itoa(dscYear4, charBuffer, 10);
@@ -3103,7 +3215,7 @@ void DSCkeybushome::update()
 
       if (!showEvent)
       {
-        strcat_P(eventInfo, PSTR(", p:"));
+        strcat_P(eventInfo, FC(", p:"));
         itoa(partition, charBuffer, 10);
         strcat(eventInfo, charBuffer);
       }
@@ -3130,13 +3242,14 @@ void DSCkeybushome::update()
       }
       if (showEvent && eventStatusMsg != "")
       {
+       std::string ps;
 #ifdef USE_JSON_EVENT
-        eventStatusMsg = std::string("{") + eventStatusMsg.append(String(FPSTR(",'status':'")).c_str()).append(getPartitionStatus(partition - 1)).append(String(FPSTR(",'partition':")).c_str()).append(partition).append("}");
+        eventStatusMsg =("{") + eventStatusMsg.append(FC(",'status':'")).append(getPartitionStatus(partition - 1,ps)).append(FC(",'partition':")).append(partition).append("}");
 #else
         if (maxPartitions() > 1)
-          eventStatusMsg.append(String(FPSTR(", Partition ")).c_str()).append(std::to_string(partition)).append(String(FPSTR(" status is ")).c_str()).append(getPartitionStatus(partition - 1));
+          eventStatusMsg.append(FC(", Partition ")).append(std::to_string(partition)).append(FC(" status is ")).append(getPartitionStatus(partition - 1,ps));
         else
-          eventStatusMsg.append(String(FPSTR(", Partition status is ")).c_str()).append(getPartitionStatus(partition - 1));
+          eventStatusMsg.append(FC(", Partition status is ")).append(getPartitionStatus(partition - 1,ps));
 #endif
         publishEventInfo(eventStatusMsg);
         eventTime = millis();
@@ -3156,9 +3269,9 @@ void DSCkeybushome::update()
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
-        strcat_P(eventInfo, PSTR("'time':'"));
+        strcat_P(eventInfo, FC("'time':'"));
 #else
-        strcat_P(eventInfo, PSTR("["));
+        strcat_P(eventInfo, FC("["));
 #endif
       }
 
@@ -3168,7 +3281,7 @@ void DSCkeybushome::update()
         int eventNumber = dsc.panelData[9] + ((dsc.panelData[4] >> 6) * 256);
         itoa(eventNumber, charBuffer, 10);
         if (eventNumber < 10)
-          strcat_P(eventInfo, PSTR("00"));
+          strcat_P(eventInfo, FC("00"));
         else if (eventNumber < 100)
           strcat(eventInfo, "0");
         strcat(eventInfo, charBuffer);
@@ -3187,9 +3300,9 @@ void DSCkeybushome::update()
       byte dscMinute = dsc.panelData[6] >> 2;
 
       if (dscYear3 >= 7)
-        strcat_P(eventInfo, PSTR("19"));
+        strcat_P(eventInfo, FC("19"));
       else
-        strcat_P(eventInfo, PSTR("20"));
+        strcat_P(eventInfo, FC("20"));
       itoa(dscYear3, charBuffer, 10);
       strcat(eventInfo, charBuffer);
       itoa(dscYear4, charBuffer, 10);
@@ -3220,7 +3333,7 @@ void DSCkeybushome::update()
 #ifdef USE_JSON_EVENT
         strcat(eventInfo, "'");
 #else
-        strcat_P(eventInfo, PSTR("] "));
+        strcat_P(eventInfo, FC("] "));
 #endif
       }
 
@@ -3231,7 +3344,7 @@ void DSCkeybushome::update()
 
         if (!showEvent)
         {
-          strcat_P(eventInfo, PSTR(", p:"));
+          strcat_P(eventInfo, FC(", p:"));
         }
 
         byte bitCount = 0;
@@ -3293,13 +3406,14 @@ void DSCkeybushome::update()
       }
       if (showEvent && eventStatusMsg != "")
       {
+       std::string ps;
 #ifdef USE_JSON_EVENT
-        eventStatusMsg = std::string("{") + eventStatusMsg.append(String(FPSTR(",'status':'")).c_str()).append(getPartitionStatus(partition - 1)).append(String(FPSTR(",'partition':")).c_str()).append(partition).append("}");
+        eventStatusMsg = ("{") + eventStatusMsg.append(FC(",'status':'")).append(getPartitionStatus(partition - 1,ps)).append(FC(",'partition':")).append(partition).append("}");
 #else
         if (maxPartitions() > 1)
-          eventStatusMsg.append(String(FPSTR(", Partition ")).c_str()).append(std::to_string(partition)).append(String(FPSTR(" status is ")).c_str()).append(getPartitionStatus(partition - 1));
+          eventStatusMsg.append(FC(", Partition ")).append(std::to_string(partition)).append(FC(" status is ")).append(getPartitionStatus(partition - 1,ps));
         else
-          eventStatusMsg.append(String(FPSTR(", Partition status is ")).c_str()).append(getPartitionStatus(partition - 1));
+          eventStatusMsg.append(FC(", Partition status is ")).append(getPartitionStatus(partition - 1,ps));
 #endif
 
         publishEventInfo(eventStatusMsg);
@@ -3312,163 +3426,163 @@ void DSCkeybushome::update()
     {
       bool decoded = true;
 
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
       switch (dsc.panelData[panelByte])
       {
       case 0x49:
-        lcdLine1 = F("Duress alarm");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Duress alarm");
+        lcdLine2 = FCS(" ");
         break;
       case 0x4A:
-        lcdLine1 = F("Disarmed");
-        lcdLine2 = F("Alarm mem");
+        lcdLine1 = FCS("Disarmed");
+        lcdLine2 = FCS("Alarm mem");
         break;
       case 0x4B:
-        lcdLine1 = F("Recent");
-        lcdLine2 = F("closing alarm");
+        lcdLine1 = FCS("Recent");
+        lcdLine2 = FCS("closing alarm");
         break;
       case 0x4C:
-        lcdLine1 = F("Zone exp");
-        lcdLine2 = F("suprvis. alarm");
+        lcdLine1 = FCS("Zone exp");
+        lcdLine2 = FCS("suprvis. alarm");
         break;
       case 0x4D:
-        lcdLine1 = F("Zone exp");
-        lcdLine2 = F("suprvis. rest");
+        lcdLine1 = FCS("Zone exp");
+        lcdLine2 = FCS("suprvis. rest");
         break;
       case 0x4E:
-        lcdLine1 = F("Keypad Fire");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Keypad Fire");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x4F:
-        lcdLine1 = F("Keypad Aux");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Keypad Aux");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x50:
-        lcdLine1 = F("Keypad Panic");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Keypad Panic");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x51:
-        lcdLine1 = F("Aux input");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Aux input");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x52:
-        lcdLine1 = F("Keypad Fire");
-        lcdLine2 = F("alarm rest");
+        lcdLine1 = FCS("Keypad Fire");
+        lcdLine2 = FCS("alarm rest");
         break;
       case 0x53:
-        lcdLine1 = F("Keypad Aux");
-        lcdLine2 = F("alarm rest");
+        lcdLine1 = FCS("Keypad Aux");
+        lcdLine2 = FCS("alarm rest");
         break;
       case 0x54:
-        lcdLine1 = F("Keypad Panic");
-        lcdLine2 = F("alarm rest");
+        lcdLine1 = FCS("Keypad Panic");
+        lcdLine2 = FCS("alarm rest");
         break;
       case 0x55:
-        lcdLine1 = F("Aux input");
-        lcdLine2 = F("alarm rest");
+        lcdLine1 = FCS("Aux input");
+        lcdLine2 = FCS("alarm rest");
         break;
         // 0x56 - 0x75: Zone tamper, zones 1-32
         // 0x76 - 0x95: Zone tamper restored, zones 1-32
       case 0x98:
-        lcdLine1 = F("Keypad");
-        lcdLine2 = F("lockout");
+        lcdLine1 = FCS("Keypad");
+        lcdLine2 = FCS("lockout");
         break;
         // 0x99 - 0xBD: Armed: Access_codes 1-34, 40-42
       case 0xBE:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Partial");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Partial");
         break;
       case 0xBF:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Special");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Special");
         publishUserArmingDisarming("<quick arm>", partition);
         break;
         // 0xC0 - 0xE4: Disarmed: Access_codes 1-34, 40-42
       case 0xE5:
-        lcdLine1 = F("Auto-arm");
-        lcdLine2 = F("canc");
+        lcdLine1 = FCS("Auto-arm");
+        lcdLine2 = FCS("canc");
         break;
       case 0xE6:
-        lcdLine1 = F("Disarmed");
-        lcdLine2 = F("Special");
+        lcdLine1 = FCS("Disarmed");
+        lcdLine2 = FCS("Special");
         break;
       case 0xE7:
-        lcdLine1 = F("Panel bat");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Panel bat");
+        lcdLine2 = FCS("trble");
         break;
       case 0xE8:
-        lcdLine1 = F("Panel AC");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Panel AC");
+        lcdLine2 = FCS("trble");
         break;
       case 0xE9:
-        lcdLine1 = F("Bell trble");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Bell trble");
+        lcdLine2 = FCS(" ");
         break;
       case 0xEA:
-        lcdLine1 = F("Fire zone");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Fire zone");
+        lcdLine2 = FCS("trble");
         break;
       case 0xEB:
-        lcdLine1 = F("Panel aux sup");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Panel aux sup");
+        lcdLine2 = FCS("trble");
         break;
       case 0xEC:
-        lcdLine1 = F("Tel line");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Tel line");
+        lcdLine2 = FCS("trble");
         break;
       case 0xEF:
-        lcdLine1 = F("Panel bat");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Panel bat");
+        lcdLine2 = FCS("rest");
         break;
       case 0xF0:
-        lcdLine1 = F("Panel AC");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Panel AC");
+        lcdLine2 = FCS("rest");
         break;
       case 0xF1:
-        lcdLine1 = F("Bell rest");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Bell rest");
+        lcdLine2 = FCS(" ");
         break;
       case 0xF2:
-        lcdLine1 = F("Fire zone");
-        lcdLine2 = F("trble rest");
+        lcdLine1 = FCS("Fire zone");
+        lcdLine2 = FCS("trble rest");
         break;
       case 0xF3:
-        lcdLine1 = F("Panel aux sup");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Panel aux sup");
+        lcdLine2 = FCS("rest");
         break;
       case 0xF4:
-        lcdLine1 = F("Tel line");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Tel line");
+        lcdLine2 = FCS("rest");
         break;
       case 0xF7:
-        lcdLine1 = F("Phone 1 FTC");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Phone 1 FTC");
+        lcdLine2 = FCS(" ");
         break;
       case 0xF8:
-        lcdLine1 = F("Phone 2 FTC");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Phone 2 FTC");
+        lcdLine2 = FCS(" ");
         break;
       case 0xF9:
-        lcdLine1 = F("Event buffer");
-        lcdLine2 = F("threshold");
+        lcdLine1 = FCS("Event buffer");
+        lcdLine2 = FCS("threshold");
         break;
       case 0xFA:
-        lcdLine1 = F("DLS lead-in");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("DLS lead-in");
+        lcdLine2 = FCS(" ");
         break;
       case 0xFB:
-        lcdLine1 = F("DLS lead-out");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("DLS lead-out");
+        lcdLine2 = FCS(" ");
         break;
       case 0xFE:
-        lcdLine1 = F("Periodic test");
-        lcdLine2 = F("trans");
+        lcdLine1 = FCS("Periodic test");
+        lcdLine2 = FCS("trans");
         break;
       case 0xFF:
-        lcdLine1 = F("System test");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("System test");
+        lcdLine2 = FCS(" ");
         break;
       default:
         decoded = false;
@@ -3478,10 +3592,11 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x09 && dsc.panelData[panelByte] <= 0x28)
       {
-        lcdLine1 = F("Zone alarm on");
+        lcdLine1 = FCS("Zone alarm on");
         byte zone = dsc.panelData[panelByte] - 8;
+
         if (zone > 0 && zone < maxZones)
-          getZone(zone - 1)->alarm = true;
+          getZone(zone-1)->alarm = true;
         decoded = true;
         zonestr = getZoneName(zone, false);
         lcdLine2 = zonestr.c_str();
@@ -3492,7 +3607,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x29 && dsc.panelData[panelByte] <= 0x48)
       {
-        lcdLine1 = F("Zone alarm off");
+        lcdLine1 = FCS("Zone alarm off");
         byte zone = dsc.panelData[panelByte] - 40;
         // if (zone > 0 && zone < maxZones)
         // zoneStatus[zone-1].alarm=false;
@@ -3505,8 +3620,8 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x56 && dsc.panelData[panelByte] <= 0x75)
       {
-        lcdLine1 = F("Zone tamper ON");
-        byte zone = dsc.panelData[panelByte] - 0x55;
+        lcdLine1 = FCS("Zone tamper ON");
+        byte zone = dsc.panelData[panelByte] - 0x54;
         // if (zone > 0 && zone < maxZones)
         //   getZone(zone - 1)->tamper = true;
         decoded = true;
@@ -3518,8 +3633,8 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x76 && dsc.panelData[panelByte] <= 0x95)
       {
-        lcdLine1 = F("Zone tamper OFF");
-        byte zone = dsc.panelData[panelByte] - 0x75;
+        lcdLine1 = FCS("Zone tamper OFF");
+        byte zone = dsc.panelData[panelByte] - 0x74;
         // if (zone > 0 && zone < maxZones)
         //   getZone(zone - 1)->tamper = false;
         decoded = true;
@@ -3531,7 +3646,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x99 && dsc.panelData[panelByte] <= 0xBD)
       {
-        lcdLine1 = F("Armed by");
+        lcdLine1 = FCS("Armed by");
         byte dscCode = dsc.panelData[panelByte] - 0x98;
         if (dscCode >= 35)
           dscCode += 5;
@@ -3544,7 +3659,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0xC0 && dsc.panelData[panelByte] <= 0xE4)
       {
-        lcdLine1 = F("Disarmed by");
+        lcdLine1 = FCS("Disarmed by");
         byte dscCode = dsc.panelData[panelByte] - 0xBF;
         if (dscCode >= 35)
           dscCode += 5;
@@ -3557,94 +3672,94 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown_data0");
+        lcdLine1 = FCS("Unknown_data0");
         lcdLine2 = " ";
-        eventstr = "unknown data";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus1(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       switch (dsc.panelData[panelByte])
       {
       case 0x03:
-        lcdLine1 = F("Cross zone");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Cross zone");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x04:
-        lcdLine1 = F("Delinquency");
-        lcdLine2 = F("alarm");
+        lcdLine1 = FCS("Delinquency");
+        lcdLine2 = FCS("alarm");
         break;
       case 0x05:
-        lcdLine1 = F("Late to close");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Late to close");
+        lcdLine2 = FCS(" ");
         break;
         // 0x24 - 0x28: Access codes 33-34, 40-42
       case 0x29:
-        lcdLine1 = F("Download");
-        lcdLine2 = F("forced ans");
+        lcdLine1 = FCS("Download");
+        lcdLine2 = FCS("forced ans");
         break;
       case 0x2B:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Auto-arm");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Auto-arm");
         break;
         // 0x2C - 0x4B: Zone battery restored, zones 1-32
         // 0x4C - 0x6B: Zone battery low, zones 1-32
         // 0x6C - 0x8B: Zone fault restored, zones 1-32
         // 0x8C - 0xAB: Zone fault, zones 1-32
       case 0xAC:
-        lcdLine1 = F("Exit inst");
-        lcdLine2 = F("prog");
+        lcdLine1 = FCS("Exit inst");
+        lcdLine2 = FCS("prog");
         break;
       case 0xAD:
-        lcdLine1 = F("Enter inst");
-        lcdLine2 = F("prog");
+        lcdLine1 = FCS("Enter inst");
+        lcdLine2 = FCS("prog");
         break;
       case 0xAE:
-        lcdLine1 = F("Walk test");
-        lcdLine2 = F("end");
+        lcdLine1 = FCS("Walk test");
+        lcdLine2 = FCS("end");
         break;
       case 0xAF:
-        lcdLine1 = F("Walk test");
-        lcdLine2 = F("begin");
+        lcdLine1 = FCS("Walk test");
+        lcdLine2 = FCS("begin");
         break;
         // 0xB0 - 0xCF: Zones bypassed, zones 1-32
       case 0xD0:
-        lcdLine1 = F("Command");
-        lcdLine2 = F("output 4");
+        lcdLine1 = FCS("Command");
+        lcdLine2 = FCS("output 4");
         break;
       case 0xD1:
-        lcdLine1 = F("Exit fault");
-        lcdLine2 = F("pre-alert");
+        lcdLine1 = FCS("Exit fault");
+        lcdLine2 = FCS("pre-alert");
         break;
       case 0xD2:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Entry delay");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Entry delay");
         break;
       case 0xD3:
-        lcdLine1 = F("Downlook rem");
-        lcdLine2 = F("trig");
+        lcdLine1 = FCS("Downlook rem");
+        lcdLine2 = FCS("trig");
         break;
       default:
         decoded = false;
@@ -3657,7 +3772,7 @@ void DSCkeybushome::update()
         byte dscCode = dsc.panelData[panelByte] - 0x03;
         if (dscCode >= 35)
           dscCode += 5;
-        lcdLine1 = F("User ");
+        lcdLine1 = FCS("User ");
         userstr = getUserName(dscCode, false, true);
         lcdLine2 = userstr.c_str();
         ;
@@ -3667,9 +3782,9 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x2C && dsc.panelData[panelByte] <= 0x4B)
       {
-        lcdLine1 = F("Zone bat OK");
+        lcdLine1 = FCS("Zone bat OK");
         byte zone = dsc.panelData[panelByte] - 43;
-        getZone(zone - 1)->battery_low = false;
+        getZone(zone-1)->battery_low = false;
         zonestr = getZoneName(zone, false);
         lcdLine2 = zonestr.c_str();
         decoded = true;
@@ -3678,9 +3793,9 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x4C && dsc.panelData[panelByte] <= 0x6B)
       {
-        lcdLine1 = F("Zone bat LOW");
+        lcdLine1 = FCS("Zone bat LOW");
         byte zone = dsc.panelData[panelByte] - 75;
-        getZone(zone - 1)->battery_low = true;
+        getZone(zone-1)->battery_low = true;
         zonestr = getZoneName(zone, false);
         lcdLine2 = zonestr.c_str();
         decoded = true;
@@ -3690,7 +3805,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x6C && dsc.panelData[panelByte] <= 0x8B)
       {
-        lcdLine1 = F("Zone fault OFF");
+        lcdLine1 = FCS("Zone fault OFF");
         byte zone = dsc.panelData[panelByte] - 107;
         // zoneStatus[zone-1].open=false;
         zonestr = getZoneName(zone, false);
@@ -3702,7 +3817,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x8C && dsc.panelData[panelByte] <= 0xAB)
       {
-        lcdLine1 = F("Zone fault ON");
+        lcdLine1 = FCS("Zone fault ON");
         byte zone = dsc.panelData[panelByte] - 139;
         // zoneStatus[zone-1].open=true;
         zonestr = getZoneName(zone, false);
@@ -3714,7 +3829,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0xB0 && dsc.panelData[panelByte] <= 0xCF)
       {
-        lcdLine1 = F("Zone bypass ON");
+        lcdLine1 = FCS("Zone bypass ON");
         byte zone = dsc.panelData[panelByte] - 175;
         // zoneStatus[zone-1].bypassed=true;
         zonestr = getZoneName(zone, false);
@@ -3726,111 +3841,111 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data1");
-        lcdLine2 = F(" ");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data1");
+        lcdLine2 = FCS(" ");
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus2(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
       switch (dsc.panelData[panelByte])
       {
       case 0x2A:
-        lcdLine1 = F("Quick exit");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Quick exit");
+        lcdLine2 = FCS(" ");
         break;
       case 0x63:
-        lcdLine1 = F("Keybus fault");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Keybus fault");
+        lcdLine2 = FCS("rest");
         break;
       case 0x64:
-        lcdLine1 = F("Keybus fault");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Keybus fault");
+        lcdLine2 = FCS(" ");
         break;
       case 0x66:
-        lcdLine1 = F("Zone bypass");
-        lcdLine2 = F("program");
+        lcdLine1 = FCS("Zone bypass");
+        lcdLine2 = FCS("program");
         break;
       case 0x67:
-        lcdLine1 = F("Command");
-        lcdLine2 = F("output 1");
+        lcdLine1 = FCS("Command");
+        lcdLine2 = FCS("output 1");
         break;
       case 0x68:
-        lcdLine1 = F("Command");
-        lcdLine2 = F("output 2");
+        lcdLine1 = FCS("Command");
+        lcdLine2 = FCS("output 2");
         break;
       case 0x69:
-        lcdLine1 = F("Command");
-        lcdLine2 = F("output 3");
+        lcdLine1 = FCS("Command");
+        lcdLine2 = FCS("output 3");
         break;
       case 0x8C:
-        lcdLine1 = F("Cold start");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Cold start");
+        lcdLine2 = FCS(" ");
         break;
       case 0x8D:
-        lcdLine1 = F("Warm start");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Warm start");
+        lcdLine2 = FCS(" ");
         break;
       case 0x8E:
-        lcdLine1 = F("Panel factory");
-        lcdLine2 = F("default");
+        lcdLine1 = FCS("Panel factory");
+        lcdLine2 = FCS("default");
         break;
       case 0x91:
-        lcdLine1 = F("Swinger shutdown");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Swinger shutdown");
+        lcdLine2 = FCS(" ");
         break;
       case 0x93:
-        lcdLine1 = F("Disarmed");
-        lcdLine2 = F("Keyswitch");
+        lcdLine1 = FCS("Disarmed");
+        lcdLine2 = FCS("Keyswitch");
         break;
       case 0x96:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Keyswitch");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Keyswitch");
         break;
       case 0x97:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Keypad away");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Keypad away");
         break;
       case 0x98:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Quick-arm");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Quick-arm");
         break;
       case 0x99:
-        lcdLine1 = F("Activate");
-        lcdLine2 = F("stay/away zones");
+        lcdLine1 = FCS("Activate");
+        lcdLine2 = FCS("stay/away zones");
         break;
       case 0x9A:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Stay");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Stay");
         break;
       case 0x9B:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("Away");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("Away");
         break;
       case 0x9C:
-        lcdLine1 = F("Armed");
-        lcdLine2 = F("No ent del");
+        lcdLine1 = FCS("Armed");
+        lcdLine2 = FCS("No ent del");
         break;
         // 0x9E - 0xC2: *1: Access_codes 1-34, 40-42
         // 0xC3 - 0xC5: *5: Access_codes 40-42
@@ -3840,8 +3955,8 @@ void DSCkeybushome::update()
         // 0xF1 - 0xF8: Keypad trouble: Slots 1-8
         // 0xF9 - 0xFE: Zone expander restored: 1-6
       case 0xFF:
-        lcdLine1 = F("Zone exp");
-        lcdLine2 = F("trble:1");
+        lcdLine1 = FCS("Zone exp");
+        lcdLine2 = FCS("trble:1");
         break;
       default:
         decoded = false;
@@ -3852,7 +3967,7 @@ void DSCkeybushome::update()
       char charBuffer[5];
       if (dsc.panelData[panelByte] >= 0x67 && dsc.panelData[panelByte] <= 0x69)
       {
-        lcdLine1 = F("Cmd O/P");
+        lcdLine1 = FCS("Cmd O/P");
         byte zone = dsc.panelData[panelByte] - 0x66;
         zonestr = getZoneName(zone, false);
         lcdLine2 = zonestr.c_str();
@@ -3863,7 +3978,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x9E && dsc.panelData[panelByte] <= 0xC2)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x9D;
-        lcdLine1 = F("[*1] by");
+        lcdLine1 = FCS("[*1] by");
         if (dscCode >= 35)
           dscCode += 5;
         userstr = getUserName(dscCode, false, true);
@@ -3875,7 +3990,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0xC3 && dsc.panelData[panelByte] <= 0xC5)
       {
         byte dscCode = dsc.panelData[panelByte] - 0xA0;
-        lcdLine1 = F("[*5] by");
+        lcdLine1 = FCS("[*5] by");
         if (dscCode >= 35)
           dscCode += 5;
         userstr = getUserName(dscCode, false, true);
@@ -3889,7 +4004,7 @@ void DSCkeybushome::update()
         byte dscCode = dsc.panelData[panelByte] - 0xC5;
         if (dscCode >= 35)
           dscCode += 5;
-        lcdLine1 = F("User");
+        lcdLine1 = FCS("User");
         userstr = getUserName(dscCode, false, true);
         lcdLine2 = userstr.c_str();
         decoded = true;
@@ -3899,7 +4014,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0xE6 && dsc.panelData[panelByte] <= 0xE8)
       {
         byte dscCode = dsc.panelData[panelByte] - 0xC3;
-        lcdLine1 = F("[*6] by");
+        lcdLine1 = FCS("[*6] by");
         if (dscCode >= 35)
           dscCode += 5;
         userstr = getUserName(dscCode, false, true);
@@ -3910,7 +4025,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0xE9 && dsc.panelData[panelByte] <= 0xF0)
       {
-        lcdLine1 = F("Keypad slot ok");
+        lcdLine1 = FCS("Keypad slot ok");
         itoa(dsc.panelData[panelByte] - 232, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -3920,7 +4035,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0xF1 && dsc.panelData[panelByte] <= 0xF8)
       {
-        lcdLine1 = F("Keypad slot trbl");
+        lcdLine1 = FCS("Keypad slot trbl");
         itoa(dsc.panelData[panelByte] - 240, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -3930,7 +4045,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0xF9 && dsc.panelData[panelByte] <= 0xFE)
       {
-        lcdLine1 = F("Zone exp ok");
+        lcdLine1 = FCS("Zone exp ok");
         itoa(dsc.panelData[panelByte] - 248, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -3940,123 +4055,123 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data2");
+        lcdLine1 = FCS("Unknown data2");
         lcdLine2 = " ";
-        eventstr = "unknown data";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus3(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
       switch (dsc.panelData[panelByte])
       {
       case 0x05:
-        lcdLine1 = F("PC/RF5132:");
-        lcdLine2 = F("Suprvis. rest");
+        lcdLine1 = FCS("PC/RF5132:");
+        lcdLine2 = FCS("Suprvis. rest");
         break;
       case 0x06:
-        lcdLine1 = F("PC/RF5132:");
-        lcdLine2 = F("Suprvis. trble");
+        lcdLine1 = FCS("PC/RF5132:");
+        lcdLine2 = FCS("Suprvis. trble");
         break;
       case 0x09:
-        lcdLine1 = F("PC5204:");
-        lcdLine2 = F("Suprvis. rest");
+        lcdLine1 = FCS("PC5204:");
+        lcdLine2 = FCS("Suprvis. rest");
         break;
       case 0x0A:
-        lcdLine1 = F("PC5204:");
-        lcdLine2 = F("Suprvis. trble");
+        lcdLine1 = FCS("PC5204:");
+        lcdLine2 = FCS("Suprvis. trble");
         break;
       case 0x17:
-        lcdLine1 = F("Zone exp 7");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("Zone exp 7");
+        lcdLine2 = FCS("rest");
         break;
       case 0x18:
-        lcdLine1 = F("Zone exp 7");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Zone exp 7");
+        lcdLine2 = FCS("trble");
         break;
         // 0x25 - 0x2C: Keypad tamper restored, slots 1-8
         // 0x2D - 0x34: Keypad tamper, slots 1-8
         // 0x35 - 0x3A: Module tamper restored, slots 9-14
         // 0x3B - 0x40: Module tamper, slots 9-14
       case 0x41:
-        lcdLine1 = F("PC/RF5132:");
-        lcdLine2 = F("Tamper rest");
+        lcdLine1 = FCS("PC/RF5132:");
+        lcdLine2 = FCS("Tamper rest");
         break;
       case 0x42:
-        lcdLine1 = F("PC/RF5132: Tamper");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("PC/RF5132: Tamper");
+        lcdLine2 = FCS(" ");
         break;
       case 0x43:
-        lcdLine1 = F("PC5208: Tamper");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("PC5208: Tamper");
+        lcdLine2 = FCS("rest");
         break;
       case 0x44:
-        lcdLine1 = F("PC5208: Tamper");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("PC5208: Tamper");
+        lcdLine2 = FCS(" ");
         break;
       case 0x45:
-        lcdLine1 = F("PC5204: Tamper");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("PC5204: Tamper");
+        lcdLine2 = FCS("rest");
         break;
       case 0x46:
-        lcdLine1 = F("PC5204: Tamper");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("PC5204: Tamper");
+        lcdLine2 = FCS(" ");
         break;
       case 0x51:
-        lcdLine1 = F("Zone exp 7");
-        lcdLine2 = F("tamper rest");
+        lcdLine1 = FCS("Zone exp 7");
+        lcdLine2 = FCS("tamper rest");
         break;
       case 0x52:
-        lcdLine1 = F("Zone exp 7");
-        lcdLine2 = F("tamper");
+        lcdLine1 = FCS("Zone exp 7");
+        lcdLine2 = FCS("tamper");
         break;
       case 0xB3:
-        lcdLine1 = F("PC5204:");
-        lcdLine2 = F("Bat rest");
+        lcdLine1 = FCS("PC5204:");
+        lcdLine2 = FCS("Bat rest");
         break;
       case 0xB4:
-        lcdLine1 = F("PC5204:");
-        lcdLine2 = F("Bat trble");
+        lcdLine1 = FCS("PC5204:");
+        lcdLine2 = FCS("Bat trble");
         break;
       case 0xB5:
-        lcdLine1 = F("PC5204: Aux");
-        lcdLine2 = F("sup rest");
+        lcdLine1 = FCS("PC5204: Aux");
+        lcdLine2 = FCS("sup rest");
         break;
       case 0xB6:
-        lcdLine1 = F("PC5204: Aux");
-        lcdLine2 = F("sup trble");
+        lcdLine1 = FCS("PC5204: Aux");
+        lcdLine2 = FCS("sup trble");
         break;
       case 0xB7:
-        lcdLine1 = F("PC5204: Out 1");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("PC5204: Out 1");
+        lcdLine2 = FCS("rest");
         break;
       case 0xB8:
-        lcdLine1 = F("PC5204: Out 1");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("PC5204: Out 1");
+        lcdLine2 = FCS("trble");
         break;
       case 0xFF:
-        lcdLine1 = F("Ext status");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Ext status");
+        lcdLine2 = FCS(" ");
         break;
       default:
         decoded = false;
@@ -4068,7 +4183,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] <= 0x04)
       {
-        lcdLine1 = F("Zone exp trouble");
+        lcdLine1 = FCS("Zone exp trouble");
         itoa(dsc.panelData[panelByte] + 2, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -4077,7 +4192,7 @@ void DSCkeybushome::update()
       }
       if (dsc.panelData[panelByte] >= 0x25 && dsc.panelData[panelByte] <= 0x2C)
       {
-        lcdLine1 = F("keypad tamper off");
+        lcdLine1 = FCS("keypad tamper off");
         itoa(dsc.panelData[panelByte] - 0x24, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -4086,7 +4201,7 @@ void DSCkeybushome::update()
       }
       if (dsc.panelData[panelByte] >= 0x2D && dsc.panelData[panelByte] <= 0x34)
       {
-        lcdLine1 = F("keypad tamper on");
+        lcdLine1 = FCS("keypad tamper on");
         itoa(dsc.panelData[panelByte] - 0x2c, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -4096,7 +4211,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x35 && dsc.panelData[panelByte] <= 0x3A)
       {
-        lcdLine1 = F("Zone exp tamper off");
+        lcdLine1 = FCS("Zone exp tamper off");
         itoa(dsc.panelData[panelByte] - 52, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -4106,7 +4221,7 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x3B && dsc.panelData[panelByte] <= 0x40)
       {
-        lcdLine1 = F("Zone exp tamper on");
+        lcdLine1 = FCS("Zone exp tamper on");
         itoa(dsc.panelData[panelByte] - 58, charBuffer, 10);
         lcdLine2 = charBuffer;
         decoded = true;
@@ -4116,47 +4231,47 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data3");
-        lcdLine2 = F(" ");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data3");
+        lcdLine2 = FCS(" ");
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus4(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
       switch (dsc.panelData[panelByte])
       {
       case 0x86:
-        lcdLine1 = F("Period test");
-        lcdLine2 = F("trble");
+        lcdLine1 = FCS("Period test");
+        lcdLine2 = FCS("trble");
         break;
       case 0x87:
-        lcdLine1 = F("Exit fault");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Exit fault");
+        lcdLine2 = FCS(" ");
         break;
       case 0x89:
-        lcdLine1 = F("Alarm cancel");
-        lcdLine2 = F(" ");
+        lcdLine1 = FCS("Alarm cancel");
+        lcdLine2 = FCS(" ");
         break;
       default:
         decoded = false;
@@ -4167,10 +4282,10 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] <= 0x1F)
       {
-        lcdLine1 = F("Zone alarm on");
+        lcdLine1 = FCS("Zone alarm on");
         byte zone = dsc.panelData[panelByte] + 33;
         if (zone > 0 && zone < maxZones)
-          getZone(zone - 1)->alarm = true;
+          getZone(zone-1)->alarm = true;
         zonestr = getZoneName(zone, false);
         lcdLine2 = zonestr.c_str();
         decoded = true;
@@ -4180,7 +4295,7 @@ void DSCkeybushome::update()
       }
       else if (dsc.panelData[panelByte] >= 0x20 && dsc.panelData[panelByte] <= 0x3F)
       {
-        lcdLine1 = F("Zone alarm off");
+        lcdLine1 = FCS("Zone alarm off");
         byte zone = dsc.panelData[panelByte] + 1;
         //   if (zone > 0 && zone < maxZones)
         //    zoneStatus[zone-1].alarm=false;
@@ -4191,7 +4306,7 @@ void DSCkeybushome::update()
       }
       else if (dsc.panelData[panelByte] >= 0x40 && dsc.panelData[panelByte] <= 0x5F)
       {
-        lcdLine1 = F("Zone tamper on");
+        lcdLine1 = FCS("Zone tamper on");
         byte zone = dsc.panelData[panelByte] - 31;
         // if (zone > 0 && zone < maxZones)
         // getZone(zone - 1)->tamper = true;
@@ -4203,7 +4318,7 @@ void DSCkeybushome::update()
       }
       else if (dsc.panelData[panelByte] >= 0x60 && dsc.panelData[panelByte] <= 0x7F)
       {
-        lcdLine1 = F("Tamper zone off");
+        lcdLine1 = FCS("Tamper zone off");
         byte zone = dsc.panelData[panelByte] - 63;
         //   if (zone > 0 && zone < maxZones)
         // getZone(zone - 1)->tamper = false;
@@ -4216,39 +4331,39 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data4");
-        lcdLine2 = F(" ");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data4");
+        lcdLine2 = FCS(" ");
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus5(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       if (dsc.panelData[panelByte] <= 0x39)
       {
         byte dscCode = dsc.panelData[panelByte] + 0x23;
-        lcdLine1 = F("Armed by");
+        lcdLine1 = FCS("Armed by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4261,7 +4376,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x3A && dsc.panelData[panelByte] <= 0x73)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x17;
-        lcdLine1 = F("Disarmed by");
+        lcdLine1 = FCS("Disarmed by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4273,33 +4388,33 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data5");
-        lcdLine2 = F(" ");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data5");
+        lcdLine2 = FCS(" ");
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus14(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = false;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       switch (dsc.panelData[panelByte])
@@ -4308,23 +4423,23 @@ void DSCkeybushome::update()
       // 0x60 - 0x7F: Zone fault, zones 33-64
       // 0x80 - 0x9F: Zone bypassed, zones 33-64
       case 0xC0:
-        lcdLine1 = F("TLink");
-        lcdLine2 = F("com fault");
+        lcdLine1 = FCS("TLink");
+        lcdLine2 = FCS("com fault");
         decoded = true;
         break;
       case 0xC2:
-        lcdLine1 = F("Tlink");
-        lcdLine2 = F("net fault");
+        lcdLine1 = FCS("Tlink");
+        lcdLine2 = FCS("net fault");
         decoded = true;
         break;
       case 0xC4:
-        lcdLine1 = F("TLink rec");
-        lcdLine2 = F("trouble");
+        lcdLine1 = FCS("TLink rec");
+        lcdLine2 = FCS("trouble");
         decoded = true;
         break;
       case 0xC5:
-        lcdLine1 = F("TLink receiver");
-        lcdLine2 = F("restored");
+        lcdLine1 = FCS("TLink receiver");
+        lcdLine2 = FCS("restored");
         decoded = true;
         break;
       default:
@@ -4335,9 +4450,9 @@ void DSCkeybushome::update()
 
       if (dsc.panelData[panelByte] >= 0x40 && dsc.panelData[panelByte] <= 0x5F)
       {
-        byte dscCode = dsc.panelData[panelByte] - 31;
-        lcdLine1 = F("Zone restored");
-        zonestr = getZoneName(dscCode, true);
+        byte zone = dsc.panelData[panelByte] - 31;
+        lcdLine1 = FCS("Zone restored");
+        zonestr = getZoneName(zone, true);
         lcdLine2 = zonestr.c_str();
         decoded = true;
         eventstr = lcdLine1.c_str();
@@ -4352,9 +4467,9 @@ void DSCkeybushome::update()
        */
       if (dsc.panelData[panelByte] >= 0x60 && dsc.panelData[panelByte] <= 0x7F)
       {
-        lcdLine1 = F("Zone fault on");
-        byte dscCode = dsc.panelData[panelByte] - 63;
-        zonestr = getZoneName(dscCode, true);
+        lcdLine1 = FCS("Zone fault on");
+        byte zone = dsc.panelData[panelByte] - 63;
+        zonestr = getZoneName(zone, true);
         lcdLine2 = zonestr.c_str();
         decoded = true;
         eventstr = lcdLine1.c_str();
@@ -4370,9 +4485,9 @@ void DSCkeybushome::update()
        */
       if (dsc.panelData[panelByte] >= 0x80 && dsc.panelData[panelByte] <= 0x9F)
       {
-        lcdLine1 = F("Zone bypass on");
-        byte dscCode = dsc.panelData[panelByte] - 95;
-        zonestr = getZoneName(dscCode, true);
+        lcdLine1 = FCS("Zone bypass on");
+        byte zone = dsc.panelData[panelByte] - 95;
+        zonestr = getZoneName(zone, true);
         lcdLine2 = zonestr.c_str();
         decoded = true;
         eventstr = lcdLine1.c_str();
@@ -4380,26 +4495,26 @@ void DSCkeybushome::update()
       }
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data14");
-        lcdLine2 = F(" ");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data14");
+        lcdLine2 = FCS(" ");
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
     long int DSCkeybushome::toInt(std::string s, int base)
     {
@@ -4413,24 +4528,24 @@ void DSCkeybushome::update()
     void DSCkeybushome::printPanelStatus16(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       switch (dsc.panelData[panelByte])
       {
       case 0x80:
-        lcdLine1 = F("Trouble");
-        lcdLine2 = F("ack");
+        lcdLine1 = FCS("Trouble");
+        lcdLine2 = FCS("ack");
         break;
       case 0x81:
-        lcdLine1 = F("RF delin");
-        lcdLine2 = F("trouble");
+        lcdLine1 = FCS("RF delin");
+        lcdLine2 = FCS("trouble");
 
         break;
       case 0x82:
-        lcdLine1 = F("RF delin");
-        lcdLine2 = F("rest");
+        lcdLine1 = FCS("RF delin");
+        lcdLine2 = FCS("rest");
 
         break;
       default:
@@ -4441,39 +4556,39 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data16");
-        lcdLine2 = F("");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data16");
+        lcdLine2 = "";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus17(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       if (dsc.panelData[panelByte] >= 0x4A && dsc.panelData[panelByte] <= 0x83)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x27;
-        lcdLine1 = F("[*1] by");
+        lcdLine1 = FCS("[*1] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4486,7 +4601,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] <= 0x24)
       {
         byte dscCode = dsc.panelData[panelByte] + 1;
-        lcdLine1 = F("[*2] by");
+        lcdLine1 = FCS("[*2] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4498,7 +4613,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x84 && dsc.panelData[panelByte] <= 0xBD)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x61;
-        lcdLine1 = F("[*2] by");
+        lcdLine1 = FCS("[*2] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4510,7 +4625,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x25 && dsc.panelData[panelByte] <= 0x49)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x24;
-        lcdLine1 = F("[*3] by");
+        lcdLine1 = FCS("[*3] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4522,7 +4637,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0xBE && dsc.panelData[panelByte] <= 0xF7)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x9B;
-        lcdLine1 = F("[*3] by");
+        lcdLine1 = FCS("[*3] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4533,34 +4648,34 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data17");
-        lcdLine2 = F("");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data17");
+        lcdLine2 = "";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus18(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
 
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       if (dsc.panelData[panelByte] <= 0x39)
@@ -4568,7 +4683,7 @@ void DSCkeybushome::update()
         byte dscCode = dsc.panelData[panelByte] + 0x23;
         if (dscCode >= 40)
           dscCode += 3;
-        lcdLine1 = F("User ");
+        lcdLine1 = FCS("User ");
         userstr = getUserName(dscCode, false, true);
         lcdLine2 = userstr.c_str();
         decoded = true;
@@ -4578,7 +4693,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x3A && dsc.panelData[panelByte] <= 0x95)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x39;
-        lcdLine1 = F("[*5] by");
+        lcdLine1 = FCS("[*5] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4590,7 +4705,7 @@ void DSCkeybushome::update()
       if (dsc.panelData[panelByte] >= 0x96 && dsc.panelData[panelByte] <= 0xF1)
       {
         byte dscCode = dsc.panelData[panelByte] - 0x95;
-        lcdLine1 = F("[*6] by");
+        lcdLine1 = FCS("[*6] by");
         if (dscCode >= 40)
           dscCode += 3;
         userstr = getUserName(dscCode, false, true);
@@ -4601,68 +4716,68 @@ void DSCkeybushome::update()
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data18");
-        lcdLine2 = F("");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data18");
+        lcdLine2 = "";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::printPanelStatus1B(byte panelByte, byte partition, bool showEvent)
     {
       bool decoded = true;
-      String lcdLine1;
-      String lcdLine2;
+      std::string lcdLine1;
+      std::string lcdLine2;
       std::string eventstr, userstr, zonestr, statusstr, zonenamestr;
 
       switch (dsc.panelData[panelByte])
       {
       case 0xF1:
-        lcdLine1 = F("System reset ");
-        lcdLine2 = F("trans");
+        lcdLine1 = FCS("System reset ");
+        lcdLine2 = FCS("trans");
         break;
       default:
         decoded = false;
       }
-      eventstr = std::string(lcdLine1.c_str()) + std::string(" ") + std::string(lcdLine2.c_str());
+      eventstr = lcdLine1 + " " + lcdLine2;
 
       if (!decoded)
       {
-        lcdLine1 = F("Unknown data1b");
-        lcdLine2 = F("");
-        eventstr = "unknown data";
+        lcdLine1 = FCS("Unknown data1b");
+        lcdLine2 = "";
+        eventstr = FCS("unknown data");
       }
 
       if (showEvent)
       {
 #ifdef USE_JSON_EVENT
         toLower(&eventstr);
-        eventStatusMsg.append(String(FPSTR("'event':'")).c_str()).append(eventstr).append(String(FPSTR("','user':'")).c_str()).append(userstr).append(String(FPSTR("','zone':'")).c_str()).append(zonestr).append("'");
+        eventStatusMsg.append(FC("'event':'")).append(eventstr).append(FC("','user':'")).append(userstr).append(FC("','zone':'")).append(zonestr).append("'");
 #else
     eventStatusMsg.append(eventstr);
     if (userstr != "")
       eventStatusMsg.append(" ").append(userstr);
     if (zonestr != "")
-      eventStatusMsg.append(String(FPSTR(" for ")).c_str()).append(zonestr);
+      eventStatusMsg.append(FC(" for ")).append(zonestr);
 #endif
       }
       else
-        publishLine2((lcdLine1 + " " + lcdLine2).c_str(), activePartition);
+        publishLine2(lcdLine1 + " " + lcdLine2, activePartition);
     }
 
     void DSCkeybushome::toLower(std::string *s)
@@ -4685,57 +4800,63 @@ void DSCkeybushome::update()
     }
 
 #if !defined(ARDUINO_MQTT)
-    void DSCkeybushome::loadZones()
-    {
 
-      for (binary_sensor::BinarySensor *obj : bMap)
-      {
-        createZoneFromObj(obj);
-      }
-    }
-
-    void DSCkeybushome::createZoneFromObj(binary_sensor::BinarySensor *obj, uint8_t p)
+void DSCkeybushome::createSensorFromObj(void *obj, uint8_t p,const char *id_type,  bool is_binary)
     {
       MatchState ms;
       char buf[20];
       char res;
-      ms.Target((char *)obj->get_object_id().c_str());
-      res = ms.Match("^[zZ](%d+)$");
-      if (res == REGEXP_MATCHED)
-      {
-        ms.GetCapture(buf, 0);
-        int z = toInt(buf, 10);
-        if (!z)
-          return;
-        zoneType *zt = getZone(z - 1);
-        if (zt->zone == z) {
-          if (zt->binary_sensor==NULL)
-            zt->binary_sensor=obj;
-          if (!zt->partition)
-            zt->partition=p;
-          return;
+      int z = 0;
+      if (strcmp(id_type,"" )==0) return;
+
+        ms.Target((char *)id_type);
+        res = ms.Match("^[zZ](%d+)$");
+        if (res == REGEXP_MATCHED && is_binary)
+        {
+          ms.GetCapture(buf, 0);
+          z = toInt(buf, 10);
         }
-        zoneType n = zonetype_INIT;
-        n.zone = z;
-        n.binary_sensor = obj;
-        n.enabled = true;
-        n.partition = p;
-        zoneStatus.push_back(n);
-        ESP_LOGD(TAG, "CreatefromOjb: added zone %d", zoneStatus.back().zone);
-      }
-    }
+
+          if (z ) {
+            sensorObjType * n = getZone(z);
+            if (n->zone == z) {
+              if (n->sensorPtr==NULL)
+                n->sensorPtr=obj;
+              if (!n->partition)
+                n->partition=p;
+              return;  //already exists
+            }
+         }
+        sensorObjType s = sensorObjType_INIT;
+        s.zone = z;
+        s.sensorPtr = obj;
+        s.enabled = true;
+        s.partition = p;
+        s.is_binary=is_binary;
+        s.id_type=id_type;
+        if (is_binary) {
+          s.hash = reinterpret_cast<binary_sensor::BinarySensor  *>(obj)->get_object_id_hash();
+        } else {
+          s.hash = reinterpret_cast<text_sensor::TextSensor *>(obj)->get_object_id_hash();
+        }
+        zoneStatus.push_back(s);
+       
+        ESP_LOGD(TAG, "CreateSensorFromOjb: added zone %d with id_code: %s", zoneStatus.back().zone,s.id_type);
+
+  }
 
 #endif
 
- DSCkeybushome::zoneType * DSCkeybushome::createZone(uint16_t z, uint8_t p)
+ DSCkeybushome::sensorObjType * DSCkeybushome::createZone(uint16_t z, uint8_t p)
 {
 
   if (!z)
-    return &zonetype_INIT;
-  zoneType n = zonetype_INIT;
+    return &sensorObjType_NULL;
+  sensorObjType n = sensorObjType_INIT;
   n.zone = z;
   n.enabled = true;
   n.partition = p;
+
 
   zoneStatus.push_back(n);
   ESP_LOGD(TAG, "createzone: added zone %d", zoneStatus.back().zone);
@@ -4894,6 +5015,17 @@ void DSCkeybushome::update()
 
     /*
     #if defined(AUTOPOPULATE)
+
+  // z1 = new binary_sensor::BinarySensor();
+  // App.register_binary_sensor(z1);
+  // z1->set_name_and_object_id("Front door (z1)", "front_door__z1_");
+  // z1->set_device_class("door");
+  // z1->set_trigger_on_initial_state(false);
+  // z1->set_object_id("z1");
+  // DSCAlarm->createZoneFromObj(z1, 1);
+  // z1->publish_state(false);
+  // z1->set_trigger_on_initial_state(true);
+
     void DSCkeybushome::loadZone(int z) {
         std::string n=std::to_string(z);
         std::string type_id="z" + n;
@@ -4901,26 +5033,16 @@ void DSCkeybushome::update()
         auto it = std::find_if(bMap.begin(), bMap.end(),  [&type_id](binary_sensor::BinarySensor* f){ return f->get_object_id() == type_id; } );
         if (it != bMap.end()) return;
 
-        template_alarm_::TemplateBinarySensor * ptr = new template_alarm_::TemplateBinarySensor();
+        binary_sensor_:BinarySensor * ptr = new binary_sensor_::BinarySensor();
         App.register_binary_sensor(ptr);
-
         ptr->set_name("Zone 19");
         ptr->set_object_id("z19");
-
     //ESP_LOGD(TAG,"get name=%s,get object_id=%s, get typeid=%s,",ptr->get_name().c_str(),ptr->get_object_id().c_str(),ptr->get_type_id().c_str());
-
        // bst->ptr->set_device_class("window");
-        ptr->set_publish_initial_state(true);
-        ptr->set_disabled_by_default(false);
+        ptr->set_trigger_on_initial_state(true)
     #if defined(ESPHOME_MQTT)
         mqtt::MQTTBinarySensorComponent * mqptr=new mqtt::MQTTBinarySensorComponent(ptr);
-        mqptr->set_component_source("mqtt");
-        App.register_component(mqptr);
-        mqptr->call();
     #endif
-        ptr->set_component_source("template_alarm.binary_sensor");
-        App.register_component(ptr);
-        ptr->call();
         gptr=ptr;
 
     }

@@ -7,12 +7,16 @@
 #include "esphome/core/component.h"
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/version.h"
+#include <string.h>
+
+
 
 #if defined(USE_MQTT)
 #include "esphome/components/mqtt/mqtt_client.h"
 #endif
 
-#if defined(USE_API)
+#if defined(USE_API) ||  defined(USE_API_CUSTOM_SERVICES)
 #include "esphome/components/api/custom_api_device.h"
 #endif
 
@@ -27,7 +31,6 @@
 #endif
 
 #ifdef ESP32
-
 #define dscClockPinDefault 22 // esp32: GPIO22
 #define dscReadPinDefault 21  // esp32: GPIO21
 #define dscWritePinDefault 18 // esp32: GPIO18
@@ -44,6 +47,7 @@
 #define maxRelays 8
 #include "dscKeybusInterface.h"
 #include "Regexp.h"
+#include <cstring> //esp-idf
 
 extern dscKeybusInterface dsc;
 extern bool forceDisconnect;
@@ -56,10 +60,13 @@ namespace esphome
   {
 #endif
 
+
 #if defined(ESPHOME_MQTT)
     extern std::function<void(const std::string &, JsonObject)> mqtt_callback;
     const char setalarmcommandtopic[] PROGMEM = "/alarm/set";
 #endif
+
+
 
     typedef struct
     {
@@ -203,12 +210,23 @@ namespace esphome
 
 #define mlsize 2
 
+// binary, no zone
 #define TRSTATUS "tr"
 #define BATSTATUS "bat"
 #define ACSTATUS "ac"
 #define RDYSTATUS "rdy"
 #define ARMSTATUS "arm"
+#define ALARMSTATUS "al"
+#define FIRE "fa"
+#define CHIMESTATUS "chm"
+
+// text, no zone
 #define SYSTEMSTATUS "ss"
+#define ZONESTATUS "zs"
+#define TROUBLE "tr_msg"
+#define EVENT "evt"
+
+// text, has numeric suffix with "_" prefix
 #define PARTITIONSTATUS "ps"
 #define ALARMSTATUS "al"
 #define PARTITIONMSG "msg"
@@ -217,13 +235,13 @@ namespace esphome
 #define BEEP "bp"
 #define ZONEALARM "za"
 #define USER "user"
-#define ZONESTATUS "zs"
-#define TROUBLE "tr_msg"
-#define EVENT "evt"
-#define FIRE "fa"
+
+// binary, has numeric suffix without "_"
 #define RELAY "r"
 #define ZONE "z"
 #define CHIMESTATUS "chm"
+
+//misc
 #define TRIGGERED "triggered"
 
 #if !defined(USE_API)
@@ -267,11 +285,20 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
       }
 #endif
 
-      struct zoneType
+#if defined (USE_ESP_IDF)
+ unsigned long millis() {
+     return esp_timer_get_time() / 1000;
+ }
+
+unsigned long micros() {
+     return esp_timer_get_time() ;
+ }
+
+ #endif
+
+      struct sensorObjType
       {
-#if !defined(ARDUINO_MQTT)
-        binary_sensor::BinarySensor *binary_sensor;
-#endif
+        void * sensorPtr;
         byte partition;
         byte zone;
         byte tamper : 1;
@@ -280,17 +307,23 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
         byte alarm : 1;
         byte enabled : 1;
         byte bypassed : 1;
+        byte is_binary: 1;
+        uint32_t hash;
+        const char * id_type;
       };
 
-      void publishZoneStatus(zoneType *zt)
+
+      void publishZoneStatus(sensorObjType *zt)
       {
         if (zt == NULL)
           return;
 #if defined(ARDUINO_MQTT)
         publishBinaryState(ZONE, zt->zone, zt->open);
 #else
-    if (zt->binary_sensor != NULL)
-      zt->binary_sensor->publish_state(zt->open);
+    if (zt->sensorPtr != nullptr && zt->is_binary) {
+       binary_sensor::BinarySensor * bs = reinterpret_cast<binary_sensor::BinarySensor*> (zt->sensorPtr);
+       bs->publish_state(zt->open);
+    }
    
 #endif
       }
@@ -375,23 +408,22 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
       void set_refresh_time(uint8_t rt);
       void set_trouble_fetch(bool fetch);
       void set_trouble_fetch_cmd(const char *cmd);
-      zoneType* createZone(uint16_t z, uint8_t p = 0);
+      sensorObjType* createZone(uint16_t z, uint8_t p = 0);
 #if !defined(ARDUINO_MQTT)
-      void createZoneFromObj(binary_sensor::BinarySensor *obj, uint8_t p = 0);
-      void createZoneFromObj(text_sensor::TextSensor *obj, uint8_t p = 0);
+      void createSensorFromObj(void *obj, uint8_t p = 0,const char * id_type="", bool is_binary=true);
+      const char * getIdType(uint32_t hash);
 #endif
       void stop();
 
     private:
-      std::vector<binary_sensor::BinarySensor *> bMap;
-      std::vector<text_sensor::TextSensor *> tMap;
 
       int activePartition = 1;
       unsigned long cmdWaitTime;
       bool extendedBufferFlag = false;
 
-      uint32_t refreshTimeSetting = 5 * 60 * 1000; // milliseconds - 5 minutes
-      bool troubleFetch = true;
+      uint32_t refreshTimeSetting = 10 * 60 * 1000; // milliseconds - 10 minutes
+      unsigned long lastTroubleLightTime;
+      bool troubleFetch = false;
       byte debug;
       const char *laststatus;
       const char *accessCode;
@@ -433,8 +465,8 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
         byte chime : 1;
       };
 
-      zoneType zonetype_INIT = {
-          .binary_sensor = NULL,
+      sensorObjType sensorObjType_INIT = {  //used to init
+          .sensorPtr = NULL,
           .partition = 0,
           .zone = 0,
           .tamper = false,
@@ -442,13 +474,34 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
           .open = false,
           .alarm = false,
           .enabled = false,
-          .bypassed = false};
+          .bypassed = false,
+          .is_binary = false,
+          .hash=0,
+          .id_type ="",
+        };
 
-      zoneType *getZone(byte z,bool create=false);
+          sensorObjType sensorObjType_NULL = { //empty return zone
+          .sensorPtr = NULL,
+          .partition = 0,
+          .zone = 0,
+          .tamper = false,
+          .battery_low = false,
+          .open = false,
+          .alarm = false,
+          .enabled = false,
+          .bypassed = false,
+          .is_binary = false,
+          .hash=0,
+          .id_type ="",
+        };
+          
+
+      sensorObjType *getZone(byte z,bool create=false);
+      sensorObjType *getSensorObj(const char * id_type);
       partitionType partitionStatus[dscPartitions];
       bool forceRefresh;
       std::string previousZoneStatusMsg, eventStatusMsg;
-      std::vector<zoneType> zoneStatus{};
+      std::vector<sensorObjType> zoneStatus{};
       byte lastStatus[dscPartitions];
       bool relayStatus[16],
           previousRelayStatus[16];
@@ -478,7 +531,11 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
     private:
       std::string getUserName(int usercode, bool append = false, bool returncode = false);
       void toLower(std::string *s);
-      const char *getPartitionStatus(byte partition);
+      std::string partitionStatusGlobal;
+      const char * getPartitionStatus(byte partition,std::string & status);
+      #ifdef USE_ESP_IDF
+      static void setupTask(void *args);
+      #endif
 
     public:
       void set_default_partition(int32_t partition);
@@ -498,7 +555,6 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
       void alarm_trigger_panic();
 
     private:
-      void loadZones();
 
       void processMenu(byte key, byte partition = -1);
 
@@ -534,7 +590,7 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
 
       bool getEnabledZonesE6(byte inputByte, byte startZone, byte partitionByte);
 
-      String getOptionsString();
+      std::string getOptionsString();
 
       bool checkUserCode(byte code);
 
@@ -572,18 +628,20 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
       void loop();
 #else
   void update() override;
+
 #endif
 
-      std::string getZoneName(int zone, bool append = false);
+
 
       void setStatus(byte partition, bool force = false, bool skip = false);
 
       // Processes status data not natively handled within the library
       void processStatus();
 
-      void printPanelTone(byte panelByte);
+      void processPanelTone(byte panelByte);
 
-      void printBeeps(byte panelByte);
+      void processBeeps(byte panelByte,byte partition);
+      void processBeeps19(byte panelByte,byte beepbyte);
 
       void printPanel_0x6E();
 
@@ -620,6 +678,8 @@ class DSCkeybushome : public api::CustomAPIDevice, public PollingComponent
       void printPanelStatus1B(byte panelByte, byte partition, bool showEvent = false);
 
       const __FlashStringHelper *statusText(uint8_t statusCode);
+      
+      std::string getZoneName(int zone, bool append = false);
     };
 
     extern DSCkeybushome *alarmPanelPtr;

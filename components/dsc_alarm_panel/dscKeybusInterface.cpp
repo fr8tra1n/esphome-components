@@ -18,91 +18,67 @@
   */
 
 #include "dscKeybus.h"
+#if not defined(IRAM_ATTR)
+#define IRAM_ATTR
+#endif
 
-byte dscKeybusInterface::dscClockPin;
-byte dscKeybusInterface::dscReadPin;
-byte dscKeybusInterface::dscWritePin;
-bool dscKeybusInterface::invertWrite;
-char dscKeybusInterface::writeKey;
-bool dscKeybusInterface::virtualKeypad;
-bool dscKeybusInterface::processModuleData;
-byte dscKeybusInterface::panelData[dscReadSize];
-byte dscKeybusInterface::panelByteCount;
-byte dscKeybusInterface::panelBitCount;
-volatile byte dscKeybusInterface::moduleData[dscReadSize];
-volatile bool dscKeybusInterface::moduleDataCaptured;
-volatile bool dscKeybusInterface::moduleDataDetected;
-volatile byte dscKeybusInterface::moduleByteCount;
-volatile byte dscKeybusInterface::moduleBitCount;
-volatile bool dscKeybusInterface::writeAlarm;
-volatile bool dscKeybusInterface::bufferOverflow;
-volatile byte dscKeybusInterface::panelBufferLength;
-volatile byte dscKeybusInterface::panelBuffer[dscBufferSize][dscReadSize];
-volatile byte dscKeybusInterface::panelBufferBitCount[dscBufferSize];
-volatile byte dscKeybusInterface::panelBufferByteCount[dscBufferSize];
-volatile byte dscKeybusInterface::isrPanelData[dscReadSize];
-volatile byte dscKeybusInterface::isrPanelByteCount;
-volatile byte dscKeybusInterface::isrPanelBitCount;
-volatile byte dscKeybusInterface::isrPanelBitTotal;
-volatile byte dscKeybusInterface::isrModuleData[dscReadSize];
-volatile byte dscKeybusInterface::moduleCmd;
-volatile byte dscKeybusInterface::moduleSubCmd;
-volatile unsigned long dscKeybusInterface::keybusTime;
-byte dscKeybusInterface::moduleSlots[6];
-moduleType dscKeybusInterface::modules[maxModules];
-byte dscKeybusInterface::moduleIdx;
-bool dscKeybusInterface::enableModuleSupervision;
-byte dscKeybusInterface::maxFields05; 
-byte dscKeybusInterface::maxFields11;
+dscKeybusInterface * dscKeybusInterfacePtr; // there is only ever going to be one instance so we can use a global pointer
 
-writeQueueType dscKeybusInterface::writeQueue[writeQueueSize];
-Stream* dscKeybusInterface::stream;
+//Callback functions to the gpio and timer interrupts.  I prefer to send the class instance pointer  when possible via the available argument for the callback 
+//which saves using a global pointer back to the class.  It's a moot effort since we only ever instantiate one class instance but what the heck..
+#ifdef USE_RP2040
+void IRAM_ATTR dscClockInterrupt_cb() {
+  
+    if (dscKeybusInterfacePtr != NULL)
+      dscKeybusInterfacePtr->dscClockInterrupt();
+}
+#else
+void IRAM_ATTR dscClockInterrupt_cb(void *args) {
+  dscKeybusInterface * ptr =reinterpret_cast<dscKeybusInterface *> (args); 
+    if (ptr != NULL)
+      ptr->dscClockInterrupt();
+}
+#endif
 
-
-byte * dscKeybusInterface::writeBuffer;
-byte dscKeybusInterface::cmdD0buffer[6];
-bool dscKeybusInterface::pendingD0;
-bool dscKeybusInterface::pending70;
-bool dscKeybusInterface::pending6E;
-
-volatile byte dscKeybusInterface::writePartition;
-volatile byte dscKeybusInterface::writeBufferIdx;
-volatile byte dscKeybusInterface::writeBufferLength;
-volatile bool dscKeybusInterface::writeDataPending;
-byte dscKeybusInterface::writeDataBit;
-volatile pgmBufferType dscKeybusInterface::pgmBuffer;
-volatile byte dscKeybusInterface::inIdx;
-volatile byte dscKeybusInterface::outIdx;
-byte dscKeybusInterface::maxZones;
-byte dscKeybusInterface::panelVersion;
-
+#if defined(USE_ESP_IDF_TIMER)
+bool  IRAM_ATTR dscDataInterrupt_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)  {
+    dscKeybusInterface * ptr = reinterpret_cast<dscKeybusInterface *> (user_data); //use class pointer passed as argument since we can
+    if (ptr != NULL)
+      ptr->dscDataInterrupt();  
+    return true;
+}
+#else
 #if defined(ESP32)
-portMUX_TYPE dscKeybusInterface::timer1Mux = portMUX_INITIALIZER_UNLOCKED;
+void IRAM_ATTR dscDataInterrupt_cb(void * args) {
+  dscKeybusInterface * ptr = reinterpret_cast<dscKeybusInterface *> (args);  //use class pointer passed as argument since we can
+    if (ptr != NULL)
+        dscKeybusInterfacePtr->dscDataInterrupt();
+}
+#else
+void IRAM_ATTR dscDataInterrupt_cb() {
+      if (dscKeybusInterfacePtr != NULL)  //use a global pointer to the class as the Arduino timers do not support passing args to isr callbacks
+        dscKeybusInterfacePtr->dscDataInterrupt();
+}
+#endif 
+#endif
 
-#if ESP_IDF_VERSION_MAJOR < 444
-hw_timer_t * dscKeybusInterface::timer1 = NULL;
-
-#else // ESP-IDF 4+
-esp_timer_handle_t timer0;
-const esp_timer_create_args_t timer0Parameters = {
-  .callback =  & dscKeybusInterface::dscDataInterrupt
-};
-
-#endif // ESP_IDF_VERSION_MAJOR
-#endif // ESP32
 
 dscKeybusInterface::dscKeybusInterface(byte setClockPin, byte setReadPin, byte setWritePin,bool setInvertWrite) {
+  dscKeybusInterfacePtr=this; 
+
   dscClockPin = setClockPin;
   dscReadPin = setReadPin;
   dscWritePin = setWritePin;
   invertWrite=setInvertWrite;
-  if (dscWritePin != 255) virtualKeypad = true;
+  if (dscWritePin != 255 && dscWritePin > 0) virtualKeypad = true;
   if (dscWritePin == dscReadPin) invertWrite=false;
   processRedundantData = true;
   displayTrailingBits = false;
   processModuleData = false;
   currentDefaultPartition=1;
   pauseStatus = false;
+  running=false;
+  firstrun=true;
 
   // start expander
 
@@ -119,50 +95,120 @@ dscKeybusInterface::dscKeybusInterface(byte setClockPin, byte setReadPin, byte s
   //end expander
 
 
+#if defined(ESP32)
+timer1Mux = portMUX_INITIALIZER_UNLOCKED;
+#endif // ESP32
+
 }
 
-void dscKeybusInterface::begin(Stream & _stream,byte setClockPin, byte setReadPin, byte setWritePin,bool setInvertWrite) {
+void dscKeybusInterface::begin(byte setClockPin, byte setReadPin, byte setWritePin,bool setInvertWrite) {
   
-  if (setClockPin > 0 && setReadPin > 0 && setWritePin > 0) {  
+  if (setClockPin > 0 && setReadPin > 0 ) {  
     dscClockPin = setClockPin;
     dscReadPin = setReadPin;
     dscWritePin = setWritePin;
     invertWrite=setInvertWrite;
+    virtualKeypad = false;
+    if (dscWritePin != 255 && dscWritePin > 0) 
+       virtualKeypad = true;
+      
   }
   if (dscWritePin == dscReadPin) {
-    pinMode(dscClockPin, INPUT_PULLUP);
-    pinMode(dscReadPin, INPUT_PULLUP);
+
+       #if defined (USE_ESP_IDF)
+        gpio_reset_pin((gpio_num_t)dscClockPin);
+        gpio_set_direction((gpio_num_t) dscClockPin, GPIO_MODE_INPUT);
+        gpio_pulldown_dis((gpio_num_t)dscClockPin);
+        gpio_pullup_en((gpio_num_t)dscClockPin);
+
+        gpio_reset_pin((gpio_num_t)dscReadPin);
+        gpio_set_direction((gpio_num_t)dscReadPin, GPIO_MODE_INPUT);
+        gpio_pulldown_dis((gpio_num_t)dscReadPin);
+        gpio_pullup_en((gpio_num_t)dscReadPin); 
+        #else
+        pinMode(dscClockPin, INPUT_PULLUP);
+        pinMode(dscReadPin, INPUT_PULLUP);
+        #endif
+
     invertWrite=false;
   } else {
-    pinMode(dscClockPin, INPUT);
-    pinMode(dscReadPin, INPUT);  
-    if (virtualKeypad) pinMode(dscWritePin, OUTPUT);  
+       #if defined (USE_ESP_IDF)
+        gpio_reset_pin((gpio_num_t)dscClockPin);
+        gpio_set_direction((gpio_num_t)dscClockPin, GPIO_MODE_INPUT);
+        gpio_pulldown_dis((gpio_num_t)dscClockPin);
+        gpio_pullup_dis((gpio_num_t)dscClockPin);
+
+        gpio_reset_pin((gpio_num_t)dscReadPin);
+        gpio_set_direction((gpio_num_t)dscReadPin, GPIO_MODE_INPUT);
+        gpio_pulldown_dis((gpio_num_t)dscReadPin);
+        gpio_pullup_dis((gpio_num_t)dscReadPin); 
+        #else
+         pinMode(dscClockPin, INPUT);
+         pinMode(dscReadPin, INPUT); 
+        #endif
+
+ 
+    if (virtualKeypad) {
+        #if defined (USE_ESP_IDF)
+        gpio_reset_pin((gpio_num_t)dscWritePin);
+        gpio_pulldown_dis((gpio_num_t)dscWritePin);
+        gpio_pullup_dis((gpio_num_t)dscWritePin); 
+        gpio_set_direction((gpio_num_t)dscWritePin, GPIO_MODE_OUTPUT);
+        #else
+           pinMode(dscWritePin, OUTPUT); 
+        #endif
+ 
+    }
   }
   
-  stream = & _stream;
-
   // Platform-specific timers trigger a read of the data line 250us after the Keybus clock changes
-
-  // Arduino/AVR Timer1 calls ISR(TIMER1_OVF_vect) from dscClockInterrupt() and is disabled in the ISR for a one-shot timer
   #if defined(ESP8266)
-  timer1_isr_init();
-  timer1_attachInterrupt(dscDataInterrupt);
-  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
-
-  // esp32 timer1 calls dscDataInterrupt() from dscClockInterrupt()
+    timer1_isr_init();
+    timer1_attachInterrupt(dscDataInterrupt_cb);
+    timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
   #elif defined(ESP32)
-  #if ESP_IDF_VERSION_MAJOR < 444
-  timer1 = timerBegin(1, 80, true);
-  timerStop(timer1);
-  timerAttachInterrupt(timer1, & dscDataInterrupt, true);
-  timerAlarmWrite(timer1, 250, true);
-  timerAlarmEnable(timer1);
-  #else // IDF4+
-  esp_timer_create( & timer0Parameters, & timer0);
-  #endif // ESP_IDF_VERSION_MAJOR
+    #if defined(USE_ESP_IDF_TIMER)
+    gptimer_config_t timer_config = {
+      .clk_src = GPTIMER_CLK_SRC_DEFAULT, // Select the default clock source
+      .direction = GPTIMER_COUNT_UP,      // Counting direction is up
+      .resolution_hz = 1000000,   // Resolution is 1 MHz, i.e., 1 tick equals 1 microsecond
+    };
+
+    gptimer_alarm_config_t alarm_config = {
+    .alarm_count = 250, // Set the actual alarm period, since the resolution is 1us, 250 is 250us
+    };
+
+    gptimer_event_callbacks_t cbs = {
+      .on_alarm = dscDataInterrupt_cb, // Call the user callback function when the alarm event occurs
+    };
+
+    gptimer_new_timer(&timer_config, &gptimer);
+    gptimer_set_alarm_action(gptimer, &alarm_config);
+    gptimer_register_event_callbacks(gptimer, &cbs, this);
+    gptimer_enable(gptimer);
+    #else
+    timer1 = timerBegin(1000000);
+    // #ifdef USE_RP2040
+    // timerAttachInterrupt(timer1, & dscDataInterrupt_cb);
+    // #else
+    timerAttachInterruptArg(timer1, & dscDataInterrupt_cb,this);
+//    #endif
+    #endif 
   #endif // ESP32
+
   // Generates an interrupt when the Keybus clock rises or falls - requires a hardware interrupt pin on Arduino/AVR
-  attachInterrupt(digitalPinToInterrupt(dscClockPin), dscClockInterrupt, CHANGE);
+  #if defined (USE_ESP_IDF) or defined(ESP32)
+    gpio_install_isr_service(0);
+    gpio_set_intr_type((gpio_num_t)dscClockPin, GPIO_INTR_ANYEDGE);
+    gpio_isr_handler_add((gpio_num_t)dscClockPin, dscClockInterrupt_cb, this);
+  #else
+    #ifdef USE_RP2040
+    attachInterrupt(digitalPinToInterrupt(dscClockPin), dscClockInterrupt_cb, CHANGE);
+    #else
+    attachInterruptArg(digitalPinToInterrupt(dscClockPin), dscClockInterrupt_cb, this, CHANGE);
+    #endif
+  #endif
+
 #if not defined(DISABLE_EXPANDER)  
   if (maxZones > 32) {
     maxFields05 = 6;
@@ -172,30 +218,31 @@ void dscKeybusInterface::begin(Stream & _stream,byte setClockPin, byte setReadPi
     maxFields11 = 4;
   }
 #endif  
+running=true;
+firstrun=false;
 
 }
 
 void dscKeybusInterface::stop() {
 
-  // Disables Arduino/AVR Timer1 interrupts
-  #if defined(ESP8266)
+   #if defined(ESP8266)
   timer1_disable();
   timer1_detachInterrupt();
-
-  // Disables esp32 timer0
   #elif defined(ESP32)
-  #if ESP_IDF_VERSION_MAJOR < 444
-  if (timer1 != NULL)  {  
-    timerAlarmDisable(timer1);
+    #if defined(USE_ESP_IDF_TIMER)
+    gptimer_del_timer(gptimer);
+   #else
     timerEnd(timer1);
-  }
-  #else // ESP-IDF 4+
-  esp_timer_stop(timer0);
-  #endif // ESP_IDF_VERSION_MAJOR
+   #endif 
   #endif // ESP32
 
+#if defined(USE_ESP_IDF)
+  gpio_intr_disable((gpio_num_t) dscClockPin);
+  gpio_isr_handler_remove((gpio_num_t) dscClockPin);
+#else
   // Disables the Keybus clock pin interrupt
   detachInterrupt(digitalPinToInterrupt(dscClockPin));
+#endif
 
   // Resets the panel capture data and counters
   panelBufferLength = 0;
@@ -206,17 +253,17 @@ void dscKeybusInterface::stop() {
 
   // Resets the keypad and module capture data
   for (byte i = 0; i < dscReadSize; i++) isrModuleData[i] = 0;
+  running=false;
 }
 
 bool dscKeybusInterface::loop() {
 
-  #if defined(ESP8266) || defined(ESP32)
-  yield();
-  #endif
 
   // Checks if Keybus data is detected and sets a status flag if data is not detected for 3s
   #if defined(ESP32)
+
   portENTER_CRITICAL( & timer1Mux);
+
   #else
   noInterrupts();
   #endif
@@ -225,7 +272,9 @@ bool dscKeybusInterface::loop() {
   else keybusConnected = true;
 
   #if defined(ESP32)
-  portEXIT_CRITICAL( & timer1Mux);
+
+  portEXIT_CRITICAL( &timer1Mux);
+
   #else
   interrupts();
   #endif
@@ -243,15 +292,17 @@ bool dscKeybusInterface::loop() {
   // Copies data from the buffer to panelData[]
   static byte panelBufferIndex = 1;
   byte dataIndex = panelBufferIndex - 1;
-  //for (byte i = 0; i < dscReadSize; i++) panelData[i] = panelBuffer[dataIndex][i];
-  memcpy((void*) panelData,(void*) &panelBuffer[dataIndex],dscReadSize);
+  for (byte i = 0; i < dscReadSize; i++) panelData[i] = panelBuffer[dataIndex][i];
+  //memcpy((void*) panelData,(void*) &panelBuffer[dataIndex],dscReadSize);
   panelBitCount = panelBufferBitCount[dataIndex];
   panelByteCount = panelBufferByteCount[dataIndex];
   panelBufferIndex++;
 
   // Resets counters when the buffer is cleared
   #if defined(ESP32)
-  portENTER_CRITICAL( & timer1Mux);
+
+  portENTER_CRITICAL( &timer1Mux);
+
   #else
   noInterrupts();
   #endif
@@ -262,7 +313,9 @@ bool dscKeybusInterface::loop() {
   }
 
   #if defined(ESP32)
-  portEXIT_CRITICAL( & timer1Mux);
+
+  portEXIT_CRITICAL( &timer1Mux);
+
   #else
   interrupts();
   #endif
@@ -304,6 +357,14 @@ bool dscKeybusInterface::loop() {
     static byte previousCmdE6_03[dscReadSize];
     if (panelData[0] == 0xE6 && panelData[2] == 0x03 && redundantPanelData(previousCmdE6_03, panelData, 8)) return false; // Status in alarm/programming, partitions 5-8
   }
+  
+  #if defined(ESP8266) || defined(ESP32)
+  #if defined(USE_ESP_IDF)
+  taskYIELD ();
+  #else
+  yield();
+  #endif
+  #endif
 
   // Processes valid panel data
   switch (panelData[0]) {
@@ -546,7 +607,8 @@ IRAM_ATTR
 dscKeybusInterface::redundantPanelData(byte  previousCmd[] , volatile byte  currentCmd[], byte checkedBytes) {
   for (byte i = 0; i < checkedBytes; i++) {
     if (previousCmd[i] != currentCmd[i]) {
-      memcpy((void*)previousCmd,(void*)currentCmd,dscReadSize);      
+       for (byte i=0;i<dscReadSize;i++) previousCmd[i]=currentCmd[i];
+      //memcpy((void*)previousCmd,(void*)currentCmd,dscReadSize);      
       return false;
     }
   }
@@ -564,47 +626,106 @@ bool dscKeybusInterface::validCRC() {
   return false;
 }
 
-// Called as an interrupt when the DSC clock changes to write data for virtual keypad and setup timers to read
-// data after an interval.
+#ifdef ESP8266
+//Pinmode is NOT isr compliant due to missing iram_attr so we copy it here
+void IRAM_ATTR _pinModeISR(uint8_t pin, uint8_t mode) {
+if(pin < 16){
+    if(mode == OUTPUT || mode == OUTPUT_OPEN_DRAIN){
+      GPF(pin) = GPFFS(GPFFS_GPIO(pin));//Set mode to GPIO
+      GPC(pin) = (GPC(pin) & (0xF << GPCI)); //SOURCE(GPIO) | DRIVER(NORMAL) | INT_TYPE(UNCHANGED) | WAKEUP_ENABLE(DISABLED)
+     // if(mode == OUTPUT_OPEN_DRAIN) GPC(pin) |= (1 << GPCD);
+      GPES = (1 << pin); //Enable
+    } else if(mode == INPUT || mode == INPUT_PULLUP){
+      GPF(pin) = GPFFS(GPFFS_GPIO(pin));//Set mode to GPIO
+      GPEC = (1 << pin); //Disable
+      GPC(pin) = (GPC(pin) & (0xF << GPCI)) | (1 << GPCD); //SOURCE(GPIO) | DRIVER(OPEN_DRAIN) | INT_TYPE(UNCHANGED) | WAKEUP_ENABLE(DISABLED)
+      if(mode == INPUT_PULLUP) {
+          GPF(pin) |= (1 << GPFPU);  // Enable  Pullup
+      }
+    }
+  } else if(pin == 16){
+    GPF16 = GP16FFS(GPFFS_GPIO(pin));//Set mode to GPIO
+    GPC16 = 0;
+    if(mode == INPUT || mode == INPUT_PULLDOWN_16){
+      if(mode == INPUT_PULLDOWN_16){
+        GPF16 |= (1 << GP16FPD);//Enable Pulldown
+      }
+      GP16E &= ~1;
+    } else if(mode == OUTPUT){
+      GP16E |= 1;
+    }
+  }
+}
+#endif
+
+
+
 void
 IRAM_ATTR
-dscKeybusInterface::dscClockInterrupt() {
+dscKeybusInterface::dscClockInterrupt() 
+ 
+{
 
   // Data sent from the panel and keypads/modules has latency after a clock change (observed up to 160us for
   // keypad data).  The following sets up a timer for each platform that will call dscDataInterrupt() in
   // 250us to read the data line.
 
   // AVR Timer1 calls dscDataInterrupt() via ISR(TIMER1_OVF_vect) when the Timer1 counter overflows
-  
+
   #if defined(ESP8266)
   timer1_write(1250);
-
-  // esp32 timer1 calls dscDataInterrupt() in 250us
   #elif defined(ESP32)
-  #if ESP_IDF_VERSION_MAJOR < 444
+  #if defined(USE_ESP_IDF_TIMER)
+  gptimer_set_raw_count(gptimer,0); 
+  gptimer_start(gptimer);
+  #else
+  timerAlarm(timer1, 250, false,0);
   timerStart(timer1);
-  #else // IDF4+
-  esp_timer_start_once(timer0, 250);
-  #endif
-  portENTER_CRITICAL( & timer1Mux);
+   #endif
+  portENTER_CRITICAL_ISR( & timer1Mux);
   #endif
 
-  static unsigned long previousClockHighTime;
-  static bool skipData = false;
+   static unsigned long previousClockHighTime;
+   static bool skipData = false;
+   static bool inInputMode=false;
+   skipModuleBit=false;
   
   // Panel sends data while the clock is high
+  #ifdef USE_ESP_IDF
+  if (gpio_get_level((gpio_num_t) dscClockPin)==HIGH) {
+  #else
   if (digitalRead(dscClockPin) == HIGH) {
+  #endif
     if (virtualKeypad ){
-        if (dscWritePin == dscReadPin && !writeDataPending)
-           pinMode(dscReadPin, INPUT_PULLUP);
-       
-        digitalWrite(dscWritePin, !invertWrite ); // Restores the data line after a virtual keypad write
+
+        if (dscWritePin == dscReadPin && !inInputMode) {
+          inInputMode=true;
+          #if defined (USE_ESP_IDF) or defined(ESP32)
+          gpio_reset_pin((gpio_num_t)dscWritePin);
+          gpio_set_direction((gpio_num_t)dscWritePin, GPIO_MODE_INPUT);
+          gpio_pulldown_dis((gpio_num_t)dscWritePin);
+          gpio_pullup_en((gpio_num_t)dscWritePin);
+          #else
+            #ifdef ESP8266
+            _pinModeISR(dscWritePin, INPUT_PULLUP);
+            #else
+            pinMode(dscWritePin, INPUT_PULLUP);
+            #endif
+            #endif
+        }
+    #ifdef USE_ESP_IDF
+        gpio_set_level((gpio_num_t) dscWritePin, !invertWrite);
+    #else
+       digitalWrite(dscWritePin, !invertWrite ); // Restores the data line after a virtual keypad write
+    #endif
     }
     previousClockHighTime = micros();
+
   }
 
   // Keypads and modules send data while the clock is low
   else {
+  
     // Saves data and resets counters after the clock cycle is complete (high for at least 1ms)
     if (micros() - previousClockHighTime > 1000) { // Tracks the clock high time to find the reset between commands
       keybusTime = millis();
@@ -615,20 +736,24 @@ dscKeybusInterface::dscClockInterrupt() {
           skipData = true;
       else {
         byte * pcmd=NULL;
+        byte * bitcount=NULL;
         static byte previousCmd05[dscReadSize];
         static byte previousCmd1B[dscReadSize]; 
+        static byte previousCmd05BitCount;
+        static  byte previousCmd1BBitCount;
 
         switch (isrPanelData[0]) {
-          case 0x05: pcmd=previousCmd05;break;
-          case 0x1B: pcmd=previousCmd1B;break;
+          case 0x05: pcmd=previousCmd05;bitcount=&previousCmd05BitCount;break;
+          case 0x1B: pcmd=previousCmd1B;bitcount=&previousCmd1BBitCount;break;
        }
-
+       //we use the packet bit number to ensure that we don't have a dropped bit. If it doesnt match the previous one, we drop it and take that one as the next to match against
+       //this is used as a cheap way to validate that a packet is most likely ok since we don't have checksums for these
        if (pcmd!=NULL) {
-          if (redundantPanelData(pcmd, isrPanelData, isrPanelByteCount) ) {
+          if (*bitcount!=isrPanelBitTotal || redundantPanelData(pcmd, isrPanelData, isrPanelByteCount) ) {
             
-              skipData = true;  //3rd or more copy, so we skip
+              skipData = true;  
           } 
-      
+          *bitcount=isrPanelBitTotal;
        } 
   
      }
@@ -636,7 +761,8 @@ dscKeybusInterface::dscClockInterrupt() {
      if (panelBufferLength == dscBufferSize) 
         bufferOverflow = true;
      else if (!skipData && panelBufferLength < dscBufferSize) {
-        memcpy((void*)&panelBuffer[panelBufferLength],(void*)isrPanelData,dscReadSize);       
+        for (byte i=0;i<dscReadSize;i++) panelBuffer[panelBufferLength][i]=isrPanelData[i]; 
+        //memcpy((void*)&panelBuffer[panelBufferLength],(void*)isrPanelData,dscReadSize);    
         panelBufferBitCount[panelBufferLength] = isrPanelBitTotal;
         panelBufferByteCount[panelBufferLength] = isrPanelByteCount;
         panelBufferLength++;
@@ -650,8 +776,8 @@ dscKeybusInterface::dscClockInterrupt() {
           moduleSubCmd = isrPanelData[2];
           moduleDataDetected = false;
           moduleDataCaptured = true; // Sets a flag for handleModule()
-
-          memcpy((void*)moduleData,(void*)isrModuleData,dscReadSize);
+          for (byte i=0;i<dscReadSize;i++) moduleData[i]=isrModuleData[i];
+         // memcpy((void*)moduleData,(void*)isrModuleData,dscReadSize);
           moduleBitCount = isrPanelBitTotal;
           moduleByteCount = isrPanelByteCount;
         }
@@ -675,16 +801,36 @@ dscKeybusInterface::dscClockInterrupt() {
 
       static bool writeStart = false;
 
-      if (dscWritePin == dscReadPin )
-            pinMode(dscWritePin, OUTPUT);  
-        
      // if (isrPanelBitTotal == writeDataBit || (writeStart && isrPanelBitTotal > writeDataBit && isrPanelBitTotal < (writeDataBit + (writeBufferLength * 8)))) {
       if (isrPanelBitTotal == writeDataBit || writeStart) {
         writeStart = true;
+        if (dscWritePin == dscReadPin && inInputMode ) {  //if bi-directional, we need to switch to write mode on the pin
+          inInputMode=false;
+          #if defined (USE_ESP_IDF) or defined(ESP32)
+          gpio_reset_pin((gpio_num_t)dscWritePin);
+          gpio_pulldown_dis((gpio_num_t)dscWritePin);
+          gpio_pullup_dis((gpio_num_t)dscWritePin); 
+          gpio_set_direction((gpio_num_t)dscWritePin, GPIO_MODE_OUTPUT);
+          #else
+            #ifdef ESP8266
+            _pinModeISR(dscWritePin, OUTPUT);
+            #else
+            pinMode(dscWritePin, OUTPUT);
+            #endif
+          #endif
+       }
         
-        if (!((writeBuffer[writeBufferIdx] >> (7 - isrPanelBitCount)) & 0x01)) digitalWrite(dscWritePin, invertWrite);
-
+        if (!((writeBuffer[writeBufferIdx] >> (7 - isrPanelBitCount)) & 0x01)) {
+            #ifdef USE_ESP_IDF
+            gpio_set_level((gpio_num_t) dscWritePin, invertWrite);
+          #else
+           digitalWrite(dscWritePin, invertWrite);
+          #endif
+        }
         if (isrPanelBitCount == 7) {
+  
+          isrModuleData[isrPanelByteCount] = writeBuffer[writeBufferIdx]; //save our sent byte to the module buffer for display
+          skipModuleBit=true; // skip reading this byte as we updated it manually in the buffer.  If we don't do this, we will get a 0 showing
           writeBufferIdx++;
 
           if (writeBufferIdx == writeBufferLength ) { //all bits written
@@ -701,35 +847,40 @@ dscKeybusInterface::dscClockInterrupt() {
     }
   }
   #if defined(ESP32)
-  portEXIT_CRITICAL( & timer1Mux);
+
+  portEXIT_CRITICAL_ISR( & timer1Mux);
+
   #endif
 }
 
-// Interrupt function called by AVR Timer1, esp8266 timer1, and esp32 timer1 after 250us to read the data line
-void IRAM_ATTR 
-#if ESP_IDF_VERSION_MAJOR < 444
-dscKeybusInterface::dscDataInterrupt() {
-    #else
-  dscKeybusInterface::dscDataInterrupt( void* arg) {      
-    #endif
+  void IRAM_ATTR dscKeybusInterface::dscDataInterrupt() {
+   
   #if defined(ESP32)
-  #if ESP_IDF_VERSION_MAJOR < 444
-  timerStop(timer1);
-  #else // IDF 4+
-  esp_timer_stop(timer0);
+   #if defined(USE_ESP_IDF_TIMER)
+     gptimer_stop(gptimer);
+   #else 
+     timerStop(timer1);
+   #endif
+  portENTER_CRITICAL_ISR( & timer1Mux);
   #endif
-  portENTER_CRITICAL( & timer1Mux);
-  #endif
+
   // Panel sends data while the clock is high
+  #ifdef USE_ESP_IDF
+  if (gpio_get_level((gpio_num_t) dscClockPin)==HIGH) {
+  #else
   if (digitalRead(dscClockPin) == HIGH) {
+  #endif
 
     // Reads panel data and sets data counters
     if (isrPanelByteCount < dscReadSize) { // Limits Keybus data bytes to dscReadSize
       if (isrPanelBitCount < 8) {
         // Data is captured in each byte by shifting left by 1 bit and writing to bit 0
         isrPanelData[isrPanelByteCount] <<= 1;
-
+  #ifdef USE_ESP_IDF
+       if (gpio_get_level((gpio_num_t) dscReadPin)==HIGH) {
+  #else
         if (digitalRead(dscReadPin) == HIGH) {
+  #endif
           isrPanelData[isrPanelByteCount] |= 1;
         }
       }
@@ -768,12 +919,16 @@ dscKeybusInterface::dscDataInterrupt() {
   else {
 
     // Keypad and module data is not buffered and skipped if the panel data buffer is filling
-    if (processModuleData && isrPanelByteCount < dscReadSize && panelBufferLength <= 1) {
+    if (processModuleData && isrPanelByteCount < dscReadSize && panelBufferLength <= 1 && !skipModuleBit) {
 
       // Data is captured in each byte by shifting left by 1 bit and writing to bit 0
       if (isrPanelBitCount < 8) {
         isrModuleData[isrPanelByteCount] <<= 1;
+        #ifdef USE_ESP_IDF
+        if (gpio_get_level((gpio_num_t) dscReadPin)==HIGH) {
+        #else
         if (digitalRead(dscReadPin) == HIGH) {
+        #endif
           isrModuleData[isrPanelByteCount] |= 1;
         } else {
           moduleDataDetected = true; // Keypads and modules send data by pulling the data line low
@@ -788,7 +943,9 @@ dscKeybusInterface::dscDataInterrupt() {
   }
 
   #if defined(ESP32)
-  portEXIT_CRITICAL( & timer1Mux);
+
+  portEXIT_CRITICAL_ISR( & timer1Mux);
+
   #endif
 
 }
@@ -798,7 +955,8 @@ IRAM_ATTR
 dscKeybusInterface::writeCharsToQueue(byte * keys,byte partition, byte len, bool alarm) {
   writeQueueType req;
   req.len = len;
-  memcpy(req.data,keys,len);
+ //memcpy(req.data,keys,len);
+  for (byte i=0;i<len;i++) req.data[i]=keys[i];
   req.alarm = alarm;
   req.writeBit = partitionToBits[partition];
   req.partition=partition;
@@ -865,6 +1023,7 @@ dscKeybusInterface::dscKeybusInterface::processPendingResponses(byte cmd) {
   }
 
 }
+
 void
 IRAM_ATTR
 dscKeybusInterface::processPendingQueue(byte cmd) {
@@ -903,5 +1062,86 @@ dscKeybusInterface::processPendingResponses_0xE6(byte subcmd) {
     return;
   }
   prepareModuleResponse(addr,17);
+
+}
+
+unsigned int dscKeybusInterface::dec2bcd(unsigned int num)
+{
+    unsigned int ones = 0;
+    unsigned int tens = 0;
+    unsigned int temp = 0;
+    ones = num%10;
+    temp = num/10;
+    tens = temp<<4;
+    return (tens + ones);
+}
+
+void dscKeybusInterface::setDateTime(unsigned int year,byte month,byte day,byte hour,byte minute) {
+
+  int dataSum = 0;
+  cmdD0buffer[0] = dec2bcd(year%100);
+  cmdD0buffer[1] = month;  
+  cmdD0buffer[2] = day;
+  cmdD0buffer[3] = dec2bcd(hour);
+  cmdD0buffer[4] = dec2bcd(minute);  
+  for (byte x = 0; x < 5; x++) {
+    dataSum += cmdD0buffer[x];
+  }
+  cmdD0buffer[5] = dataSum % 256;
+  pendingD0=true;
+  byte zoneupdate[6];
+  memset(zoneupdate, 0xFF, 6); //set update slots to 1's. Only zero bits indicate a request
+  zoneupdate[3] &= 0xfd; //set update slot for cmd d0
+  writeCharsToQueue(zoneupdate, 1, 6);
+}
+
+void
+IRAM_ATTR 
+dscKeybusInterface::processCmd70() {
+  if (pgmBuffer.idx + 5 > pgmBuffer.len) return;
+  updateWriteBuffer((byte*) &pgmBuffer.data[pgmBuffer.idx], 9,1,5);
+  pgmBuffer.idx += 5;    
+  byte key = 0;
+  if (pgmBuffer.sendhash) key=0x2D; //'#' // setup to send final # cmd to complete write update to panel
+  if (pgmBuffer.idx < pgmBuffer.len) {
+    pending70 = true;
+    key = 0xAA; //more data available so set up also for next group send request
+  }
+  if (key) writeCharsToQueue( & key, pgmBuffer.partition);
+
+}
+
+void dscKeybusInterface::setLCDReceive(byte digits,byte partition) {
+  if (!partition) partition=currentDefaultPartition;
+  pgmBuffer.idx = 0;
+  byte b = (digits / 2) + (digits % 2); //full bytes
+  b+=b/4;//checksum bytes
+  b += b % 5 ? 5 - b % 5 : 0; //round up to next 5 bytes as thats the size of cmds70/6e including chksum
+  pgmBuffer.len = b;
+  pgmBuffer.partition=partition;
+  pending6E=true;
+  pgmBuffer.dataPending=false;
+  byte key = 0xa5;
+  writeCharsToQueue( & key,partition);
+}
+
+void dscKeybusInterface::setLCDSend(byte partition,bool sendhash) {
+  if (!partition) partition=currentDefaultPartition;
+  int dataSum;
+  pgmBuffer.idx = 0;
+  pending70 = true;
+  byte key = 0xAA;
+  pgmBuffer.sendhash=sendhash;
+  pgmBuffer.dataPending=false;
+  
+  for (int y=0;y<pgmBuffer.len;y=y+5) { //calculate checksums for all groups of 4 bytes
+    dataSum = 0;        
+    for (int x = 0; x < 4; x++) {
+        dataSum += pgmBuffer.data[x+y];
+    }
+    pgmBuffer.data[y+4]=dataSum%256;
+  }
+
+  writeCharsToQueue( & key, partition);
 
 }

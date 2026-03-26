@@ -1,7 +1,7 @@
 #for documentation see project at https://github.com/Dilbert66/esphome-VistaECP
 substitutions:
   name: "vistaalarm" #unique network name, system name
-  friendlyName: "Vista Alarm"  #used as the friendly name of your application in HomeAssistant
+  friendlyName: "VistaAlarm"  #used as the friendly name of your application in HomeAssistant
   panelId: "VistaAlarm"         #used as the service variable name.
   accesscode: !secret access_code 
   
@@ -23,7 +23,7 @@ vista_alarm_panel:
   # without these entries except you will have a delay of TTL milliseconds before 
   # the report of closed zones. 
   
-  rfseriallookup: "0019994:2:66,0818433:4:22,0123456:1:55,0399512:1:17" # serial1:loop#:zone1,serial2:loop#:zone2
+  rfseriallookup: "0019994:2:66,0818433:4:22,0123456:1:55" # serial1:loop#:zone1,serial2:loop#:zone2
  
   defaultpartition: "1" #set to your main partition
   vistadebuglevel: "3" #component debug level for messages
@@ -33,13 +33,31 @@ vista_alarm_panel:
   keypadaddr1: "17" #partition 1 virtual keyapd
   keypadaddr2: "0" #partition 2 virtual keypad. set to 0 to disable
   keypadaddr3: "0" #partition 3 virtual keypad. set to 0 to disable
- 
+
+  # 5881enh RF receiver emulation. 
+  # For vista20p or lower address 0 and you are limmited to 1 physical or emulated rf receiver.
+  # For vista128 or 250 use whatever device address you configured on your panel for the emulated rf receiver.  
+  # You CANNOT use the same address as an existing device.
+# Emulated zone setup.  
+# Make up a serial number/loop and enter it in your panel zone programming and in the zone setup section here
+# Ensure you use type 4 (RF unsupervised zone) in your panel.
+# Example rf zone config:
+#  - platform: vista_alarm_panel
+#    id: z16
+#    name: "rf zone 16 (z16)"
+#    device_class: window   
+#    rf_serial: 0629444
+#    rf_loop: 1
+
+  emulate_rf_receiver: true
+  rf_receiver_addr: "0"  
+
   #AUI address from program field *189 to use for zone status queries (open/close and bypass). 
   #Ensure it is not assigned to a real keypad or to Total Connect 2.0. For those panels, you can select auiaddr: 5 or 6.
   #As a final option, you can assign it to the same address as your existing AUI display address of 1
   #Note: Older vista20 panels only have addresses 1 and 2 while newer will have 1,2,5 and 6. For Vista128,Vista250 commercial panels, ensure the address used is setup as an AUI keypad in program #93, device programming
   
-  auiaddr: "2" #use auiaddr: 5 or 6 if you already have address 2 assigned to Total Connect or another keypad
+  auiaddr: "0" #use auiaddr: 5 or 6 if you already have address 2 assigned to Total Connect or another keypad. Defaults to 0 - disabled
 
   ##esp32
   rxpin: "22" #GPIO pin to use for data receive (yellow line) 
@@ -97,7 +115,7 @@ vista_alarm_panel:
 esp32: 
   board: nodemcu-32s
   framework: 
-    type: arduino
+    type: esp-idf
     version: recommended
 
 #esp8266:    
@@ -195,7 +213,8 @@ logger:
 
 api:
    encryption:
-     key: !secret encryption_key   
+     key: !secret encryption_key  
+   custom_services: true 
  
 #to use mqtt disable the api: section above. This enables you to use esphome with 
 #non homeassistant systems
@@ -284,6 +303,8 @@ binary_sensor:
     id: z17  
     name: "zone 17 z17"
     device_class: window   
+    rf_serial: 0629444
+    rf_loop: 1
   
 # you can also add fields to show fault statuses of other devices you have.  The id will be 1 + device address.  
 
@@ -533,14 +554,14 @@ text_sensor:
     id: bp_2    
     
 #optional cmd button example.  Send any keypad keys 
-button:
-    - platform: vista_alarm_panel
-      name: Gate Button
-      id: gate1
-      icon: "mdi:emoticon-outline"    
-      on_press:
-        - lambda: |-
-            $panelId->alarm_keypress_partition("${accesscode}#701",1);    
+#button:
+#    - platform: template
+#      name: Gate Button
+#      id: gate1
+#      icon: "mdi:emoticon-outline"    
+#      on_press:
+#        - lambda: |-
+#            $panelId->alarm_keypress_partition("${accesscode}#701",1);    
 
    
  #- platform: gpio  #example use of pin d8 as a zone trigger port for the emulated zone expander

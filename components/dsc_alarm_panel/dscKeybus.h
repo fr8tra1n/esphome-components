@@ -23,30 +23,70 @@
 #ifndef dscKeybus_h
 #define dscKeybus_h
 
-#include <Arduino.h>
 
-#if !defined(ARDUINO_MQTT)
+
+#if defined(USE_ESP_IDF_TIMER) or defined(USE_ESP_IDF) or defined(ESP32)
+#define USE_ESP_IDF_TIMER
+#ifndef ESP32
+#define ESP32
+#endif
+#include <cstring>
+#include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include <esp_attr.h>
+#include <stdio.h>
+#include <cstdlib>
+#include <string>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
+#endif
+
+#if defined(USE_ESP_IDF)
+typedef char byte;
+typedef char __FlashStringHelper;
+
+#define HIGH 1
+#define LOW 0
+
+#define bitRead(value, bit)            (((value) >> (bit)) & 0x01)
+#define bitSet(value, bit)             ((value) |= (1UL << (bit)))
+#define bitClear(value, bit)           ((value) &= ~(1UL << (bit)))
+#define bitToggle(value, bit)          ((value) ^= (1UL << (bit)))
+#define bitWrite(value, bit, bitvalue) ((bitvalue) ? bitSet(value, bit) : bitClear(value, bit))
+
+#define printf_P(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#define strcat_P(fmt,...) strcat(fmt, ##__VA_ARGS__)
+
+#define PSTR(s)   ((const char *)(s))
+#define FPSTR(pstr_pointer) (reinterpret_cast<const __FlashStringHelper *>(pstr_pointer))
+#define F(string_literal) (FPSTR(PSTR(string_literal)))
+#endif
+
+#if not defined(ARDUINO_MQTT)
 #include "esphome/core/defines.h"
 #endif
 
-#if defined(ESP8266)
+
+
+#if defined(ESP32)
+const byte dscPartitions = 8;
+const byte dscZones = 8;
+const byte dscBufferSize = 50;
+const byte dscReadSize = 16;
+#else
 const byte dscPartitions = 4;
 const byte dscZones = 8;
 const byte dscBufferSize = 50;
 const byte dscReadSize = 16;
-#elif defined(ESP32) 
-const byte dscPartitions = 8;
-const byte dscZones = 8;
-const DRAM_ATTR byte dscBufferSize = 50;
-const DRAM_ATTR byte dscReadSize = 16;
 #endif
 
 
-
-#if defined(ESP8266)
+#if defined(ESP32) 
 const byte maxModules = 4;
 const byte writeQueueSize=20; //zone pending update queue
-#elif defined(ESP32)
+#else
 const byte maxModules = 4;
 const byte writeQueueSize=20; //zone pending update queue
 #endif
@@ -103,11 +143,21 @@ class dscKeybusInterface {
 
   public:
 
+    #if defined (USE_ESP_IDF)
+  unsigned long millis() {
+     return esp_timer_get_time() / 1000;
+ }
+
+  unsigned long micros() {
+     return esp_timer_get_time();
+ }
+
+ #endif
     // Initializes writes as disabled by default
     dscKeybusInterface(byte setClockPin, byte setReadPin, byte setWritePin = 255,bool setInvertWrite=true);
 
     // Interface control
-    void begin(Stream &_stream = Serial,byte setClockPin=0, byte setReadPin=0, byte setWritePin=0,bool setInvertWrite=true);             // Initializes the stream output to Serial by default
+    void begin(byte setClockPin=0, byte setReadPin=0, byte setWritePin=255,bool setInvertWrite=true);             // Initializes the stream output to Serial by default
     bool loop();                                      // Returns true if valid panel data is available
     void stop();                                      // Disables the clock hardware interrupt and data timer interrupt
     void resetStatus();                               // Resets the state of all status components as changed for sketches to get the current status
@@ -132,7 +182,7 @@ class dscKeybusInterface {
 
     // These can be configured in the sketch setup() before begin()
     bool hideKeypadDigits;          // Controls if keypad digits are hidden for publicly posted logs (default: false)
-    static bool processModuleData;  // Controls if keypad and module data is processed and displayed (default: false)
+     bool processModuleData;  // Controls if keypad and module data is processed and displayed (default: false)
     bool displayTrailingBits;       // Controls if bits read as the clock is reset are displayed, appears to be spurious data (default: false)
 
     // Panel time
@@ -170,7 +220,7 @@ class dscKeybusInterface {
     byte alarmZones[dscZones], alarmZonesChanged[dscZones];  // Zone alarm status is stored in an array using 1 bit per zone, up to 64 zones
     bool pgmOutputsStatusChanged;
     byte pgmOutputs[2], pgmOutputsChanged[2];
-    static byte panelVersion;
+     byte panelVersion;
     bool writeAccessCode[dscPartitions];  
 
     /* panelData[] and moduleData[] store panel and keypad/module data in an array: command [0], stop bit by itself [1],
@@ -182,8 +232,8 @@ class dscKeybusInterface {
      *   00000101 0 10000001 00000001 10010001 11000111 [0x05] Partition 1: Ready Backlight - Partition ready | Partition 2: disabled
      *            ^ Byte 1 (stop bit)
      */
-    static byte panelData[dscReadSize];
-    static volatile byte moduleData[dscReadSize];
+     byte panelData[dscReadSize];
+     volatile byte moduleData[dscReadSize];
 
     // status[] and lights[] store the current status message and LED state for each partition.  These can be accessed
     // directly in the sketch to get data that is not already tracked in the library.  See printPanelMessages() and
@@ -195,18 +245,12 @@ class dscKeybusInterface {
     bool handleModule();
 
     // True if dscBufferSize needs to be increased
-    static volatile bool bufferOverflow;
+     volatile bool bufferOverflow;
 
-    // Timer interrupt function to capture data - declared as public for use by AVR Timer1
-    #if ESP_IDF_VERSION_MAJOR < 444 // use old style timers. esp_idf high res timers don't work right on esphome 
-    static void dscDataInterrupt();
-    #else
-    static void dscDataInterrupt( void* arg);
-    #endif
 
     // Deprecated
     bool processRedundantData;  // Controls if repeated periodic commands are processed and displayed (default: false)
-    static volatile byte moduleCmd, moduleSubCmd;    
+    volatile byte moduleCmd, moduleSubCmd;    
     
     //start expander
     void setZoneFault(byte zone,bool fault) ;
@@ -219,13 +263,22 @@ class dscKeybusInterface {
     void updateModules();
     void addRelayModule(); 
     void clearZoneRanges();
-    static bool enableModuleSupervision;  
-    static byte maxZones;
+     bool enableModuleSupervision;  
+     byte maxZones;
     //end expander
-    static volatile pgmBufferType pgmBuffer;
+     volatile pgmBufferType pgmBuffer;
     bool keybusVersion1;  
     bool validCRC();    
-    static byte panelBitCount, panelByteCount;
+     byte panelBitCount, panelByteCount;
+ 
+
+    void dscClockInterrupt();
+
+      // Timer interrupt function to capture data - declared as public for use by AVR Timer1
+    void dscDataInterrupt();
+
+    bool firstrun;
+    bool running;
     
   private:
 
@@ -365,15 +418,18 @@ class dscKeybusInterface {
 
 
     void writeKeys(const char * writeKeysArray);
-    static void dscClockInterrupt();
-    static bool redundantPanelData(byte   previousCmd[], volatile byte   currentCmd[], byte checkedBytes = dscReadSize);
+
+
+     bool redundantPanelData(byte   previousCmd[], volatile byte   currentCmd[], byte checkedBytes = dscReadSize);
     #if defined(ESP32)
-    #if ESP_IDF_VERSION_MAJOR < 444
-    static hw_timer_t * timer1;
+#if not defined(USE_ESP_IDF_TIMER)
+     hw_timer_t * timer1;
+#else
+    gptimer_handle_t gptimer;
+ #endif
+     portMUX_TYPE timer1Mux;
     #endif
-    static portMUX_TYPE timer1Mux;
-    #endif
-    static Stream* stream;
+
     //const char* writeKeysArray;
    // bool writeKeysPending;
     bool queryResponse;
@@ -393,62 +449,62 @@ class dscKeybusInterface {
     byte previousPgmOutputs[2];
 
 
-    static byte dscClockPin;
-    static byte dscReadPin;
-    static byte dscWritePin;
-    static bool invertWrite;
-    //static byte writeByte, writeBit;
-    static bool virtualKeypad;
-    static char writeKey;
+     byte dscClockPin;
+     byte dscReadPin;
+     byte dscWritePin;
+     bool invertWrite;
+    // byte writeByte, writeBit;
+     bool virtualKeypad;
+      char writeKey;
 
-    static volatile bool writeAlarm;
-    static volatile bool moduleDataDetected, moduleDataCaptured;
-    static volatile unsigned long keybusTime;
-    static volatile byte panelBufferLength;
-    static volatile byte panelBuffer[dscBufferSize][dscReadSize];
-    static volatile byte panelBufferBitCount[dscBufferSize], panelBufferByteCount[dscBufferSize];
-    static volatile byte moduleBitCount, moduleByteCount;
+     volatile bool writeAlarm;
+     volatile bool moduleDataDetected, moduleDataCaptured;
+     volatile unsigned long keybusTime;
+     volatile byte panelBufferLength;
+     volatile byte panelBuffer[dscBufferSize][dscReadSize];
+     volatile byte panelBufferBitCount[dscBufferSize], panelBufferByteCount[dscBufferSize];
+     volatile byte moduleBitCount, moduleByteCount;
 
-    static volatile byte isrPanelData[dscReadSize], isrPanelBitTotal, isrPanelBitCount, isrPanelByteCount;
-    static volatile byte isrModuleData[dscReadSize];
+     volatile byte isrPanelData[dscReadSize], isrPanelBitTotal, isrPanelBitCount, isrPanelByteCount;
+     volatile bool skipModuleBit;
+     volatile byte isrModuleData[dscReadSize];
     
     //start expander
    
     const byte zoneOpen=3; //fault 
     const byte zoneClosed=2;// Normal 
-    static byte moduleIdx;    
-    static void prepareModuleResponse(byte cmd,int bit); 
+     byte moduleIdx;    
+     void prepareModuleResponse(byte cmd,int bit); 
     void removeModule(byte address);
-    static void setPendingZoneUpdate();
+     void setPendingZoneUpdate();
     void setSupervisorySlot(byte slot,bool set);
     zoneMaskType getUpdateMask(byte address);    
-    static byte maxFields05; 
-    static byte maxFields11;
-    static moduleType modules[maxModules];
-    static byte moduleSlots[6];
+     byte maxFields05; 
+     byte maxFields11;
+     moduleType modules[maxModules];
+     byte moduleSlots[6];
   
-    static void processCmd70();
+     void processCmd70();
     unsigned int dec2bcd(unsigned int);
      //end expander
 
      //start new command handling 
-    volatile static  byte writePartition;    
-    static byte * writeBuffer;
-    static byte cmdD0buffer[6];  
-    static bool pendingD0,pending70,pending6E;    
-    volatile static byte outIdx,inIdx;     
-    static void processPendingResponses(byte cmd);
-    static void processPendingResponses_0xE6(byte cmd);  
-    static void processPendingQueue(byte cmd);    
-    static void updateWriteBuffer(byte* src, int bit=9, byte partition=-1,int len=1, bool alarm=false);     
-    static byte writeDataBit;
-    volatile static byte writeBufferLength,writeBufferIdx;
-    volatile static bool writeDataPending;
-    static writeQueueType writeQueue[writeQueueSize];
-    static void writeCharsToQueue(byte* keys,byte partition=1,byte len=1,bool alarm=false);
+    volatile   byte writePartition;    
+     byte * writeBuffer;
+     byte cmdD0buffer[6];  
+     bool pendingD0,pending70,pending6E;    
+    volatile  byte outIdx,inIdx;     
+     void processPendingResponses(byte cmd);
+     void processPendingResponses_0xE6(byte cmd);  
+     void processPendingQueue(byte cmd);    
+     void updateWriteBuffer(byte* src, int bit=9, byte partition=-1,int len=1, bool alarm=false);     
+     byte writeDataBit;
+    volatile  byte writeBufferLength,writeBufferIdx;
+    volatile  bool writeDataPending;
+     writeQueueType writeQueue[writeQueueSize];
+     void writeCharsToQueue(byte* keys,byte partition=1,byte len=1,bool alarm=false);
     byte getWriteBitFromPartition(byte partition);
     //end new command handling    
- 
-};
 
+};
 #endif // dscKeybus_h

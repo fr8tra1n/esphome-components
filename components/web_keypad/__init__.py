@@ -20,6 +20,7 @@ from esphome.const import (
     CONF_LOG,
     CONF_VERSION,
     CONF_LOCAL,
+    PLATFORM_RP2040,
     PLATFORM_ESP32,
     PLATFORM_ESP8266,
     PLATFORM_BK72XX,
@@ -31,6 +32,8 @@ import pathlib
 import logging
 from esphome.helpers import copy_file_if_changed
 from esphome.core import CORE, coroutine_with_priority
+from esphome.components.logger import request_log_listener
+from esphome.types import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 DEPENDENCIES = ["network"]
@@ -52,6 +55,7 @@ CONF_SORTING_GROUPS = "sorting_groups"
 CONF_SORTING_WEIGHT = "sorting_weight"
 CONF_WEB_KEYPAD_ID="web_keypad_id"
 CONF_WEB_KEYPAD="web_keypad"
+CONF_STACK_SIZE="stack_size"
 
 web_keypad_ns = cg.esphome_ns.namespace("web_keypad")
 WebKeypad = web_keypad_ns.class_("WebServer", cg.Component, cg.Controller)
@@ -109,6 +113,17 @@ WEBKEYPAD_SORTING_SCHEMA = cv.Schema(
     }
 )
 
+def _consume_web_server_sockets(config: ConfigType) -> ConfigType:
+    """Register socket needs for web_keypad component."""
+    from esphome.components import socket
+
+    # Web server needs 1 listening socket + typically 2 concurrent client connections
+    # (browser makes 2 connections for page + event stream)
+    sockets_needed = 3
+    socket.consume_sockets(sockets_needed, "web_keypad")(config)
+    return config
+
+
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -126,6 +141,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_KEYPAD, default=True):cv.boolean,
             cv.Optional(CONF_KEYPAD_URL):cv.string,  
             cv.Optional(CONF_SERVICE_LAMBDA): cv.lambda_,
+            cv.Optional(CONF_STACK_SIZE):cv.int_,
             cv.Optional(CONF_ENABLE_PRIVATE_NETWORK_ACCESS, default=True): cv.boolean,
             cv.Optional(CONF_CERTIFICATE): cv.All(
                 cv.string
@@ -141,17 +157,19 @@ CONFIG_SCHEMA = cv.All(
                     cv.Required(CONF_PASSWORD): cv.All(
                         cv.string_strict, cv.Length(min=1)
                     ),
-                    cv.Optional(CONF_ENCRYPTION, default=False):cv.boolean,                     
+                    cv.Optional(CONF_ENCRYPTION, default=False):cv.boolean,                    
                     },
             ),
             cv.Optional(CONF_INCLUDE_INTERNAL, default=False): cv.boolean,
             cv.SplitDefault(
                 CONF_OTA,
+                esp32=False,
                 esp8266=False,
                 esp32_arduino=False,
                 esp32_idf=False,
                 bk72xx=False,
                 rtl87xx=False,
+                rp2040=False
             ): cv.boolean,
             cv.Optional(CONF_LOG, default=False): cv.boolean,
             cv.Optional(CONF_LOCAL, default=True): cv.boolean,
@@ -161,6 +179,7 @@ CONFIG_SCHEMA = cv.All(
     #cv.only_on([PLATFORM_ESP32]),
     default_url,
     validate_sorting_groups,
+    _consume_web_server_sockets,
 
 )
 
@@ -179,7 +198,7 @@ async def add_entity_config(entity, config):
     web_keypad = await cg.get_variable(config[CONF_WEB_KEYPAD_ID])
     sorting_weight = config.get(CONF_SORTING_WEIGHT, 50)
     sorting_group_hash = hash(config.get(CONF_SORTING_GROUP_ID))
-
+    cg.add_define("USE_WEBSERVER_SORTING")
     cg.add(
         web_keypad.add_entity_config(
             entity,
@@ -233,9 +252,11 @@ def add_resource_as_progmem(
 
 @coroutine_with_priority(40.0)
 async def to_code(config):
+
+    # Track controller registration for StaticVector sizing
+    CORE.register_controller()
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    cg.add_library("intrbiz/Crypto",None)
     version = config[CONF_VERSION]
 
     cg.add(var.set_port(config[CONF_PORT]))
@@ -254,10 +275,14 @@ async def to_code(config):
     else:
         cg.add(var.set_css_url(config[CONF_CSS_URL]))
         cg.add(var.set_js_url(config[CONF_JS_URL]))
+    if CONF_OTA in config and config[CONF_OTA]:
+         cg.add_define("USE_WEBKEYPAD_OTA")
     cg.add(var.set_allow_ota(config[CONF_OTA]))
     cg.add(var.set_expose_log(config[CONF_LOG]))
     cg.add(var.set_show_keypad(config[CONF_KEYPAD]))   
-
+    
+    if config[CONF_LOG]:
+        request_log_listener()  # Request a log listener slot for web server log streaming
     
     if CONF_PARTITIONS in config:
         cg.add(var.set_partitions(config[CONF_PARTITIONS]))   
@@ -269,7 +294,13 @@ async def to_code(config):
         cg.add(var.set_certificate_key(config[CONF_CERTIFICATE_KEY]))
         
     if CONF_AUTH in config:
-        cg.add(var.set_auth(config[CONF_AUTH][CONF_USERNAME],config[CONF_AUTH][CONF_PASSWORD],config[CONF_AUTH][CONF_ENCRYPTION]));    
+        # if config[CONF_AUTH][CONF_ENCRYPTION] and CORE.is_esp8266:
+        #     raise cv.Invalid(
+        #         "Encryption is not supported on the ESP8266 due to memory constraints."
+        #     )
+        cg.add(var.set_auth(config[CONF_AUTH][CONF_USERNAME],config[CONF_AUTH][CONF_PASSWORD],config[CONF_AUTH][CONF_ENCRYPTION])); 
+        if config[CONF_AUTH][CONF_ENCRYPTION]: # and (CORE.is_esp32 or CORE.is_rp2040 or CORE.is_esp8266):  
+            cg.add_define("USE_WEBKEYPAD_ENCRYPTION")  
                
     if CONF_CSS_INCLUDE in config:
         cg.add_define("USE_WEBKEYPAD_CSS_INCLUDE")
@@ -293,25 +324,26 @@ async def to_code(config):
         path = CORE.relative_config_path(config[CONF_JS_INCLUDE])
         with open(file=path, encoding="utf-8") as js_file:
             add_resource_as_progmem("JS_INCLUDE", js_file.read())
-           
+
+    if CONF_CONFIG in config and config[CONF_CONFIG]:
+        with open( CORE.relative_config_path(config[CONF_CONFIG]),'r') as file:
+            configuration = yaml.safe_load(file)
+        add_resource_as_progmem("CONFIG_INCLUDE", json.dumps(configuration), False)
+          
     cg.add(var.set_include_internal(config[CONF_INCLUDE_INTERNAL]))
        
     if CONF_KEYPAD_URL in config and config[CONF_KEYPAD_URL]:
         response = requests.get(config[CONF_KEYPAD_URL])
         configuration = yaml.safe_load(response.text)
-        output = json.dumps(configuration)
-        cg.add(var.set_keypad_config(output))        
+        add_resource_as_progmem("CONFIG_INCLUDE", json.dumps(configuration), False)        
        
-    if CONF_CONFIG in config and config[CONF_CONFIG]:
-        with open( CORE.relative_config_path(config[CONF_CONFIG]),'r') as file:
-            configuration = yaml.safe_load(file)
-        output = json.dumps(configuration)
-        cg.add(var.set_keypad_config(output))
+
     if CORE.using_arduino:
         if CORE.is_esp32:        
             cg.add_library("Update", None)     
             
     if (sorting_group_config := config.get(CONF_SORTING_GROUPS)) is not None:
+        cg.add_define("USE_WEBSERVER_SORTING")
         add_sorting_groups(var, sorting_group_config)
 
     # src=os.path.join(pathlib.Path(__file__).parent.resolve(),"mongoose/mongoose.h")

@@ -14,6 +14,7 @@ from esphome.const import (
     PLATFORM_ESP8266,
     PLATFORM_BK72XX,
     PLATFORM_RTL87XX,
+    PLATFORM_RP2040,
     CONF_ON_MESSAGE,
     CONF_TRIGGER_ID,
 )
@@ -25,6 +26,7 @@ from esphome.core import CORE, coroutine_with_priority
 from esphome.components import (
     template,text
 )
+from esphome.types import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,8 +80,17 @@ TelegramMessageTrigger = web_notify_ns.class_(
     "TelegramMessageTrigger", automation.Trigger.template(cg.std_string)
 )
 
-RemoteData= web_notify_ns.struct(f"RemoteData")
-SendData= web_notify_ns.struct(f"SendData")
+RemoteData= web_notify_ns.namespace(f"RemoteData&")
+
+
+def _consume_telegram_client_sockets(config: ConfigType) -> ConfigType:
+    """Register socket needs for telegram component."""
+    from esphome.components import socket
+
+    # Telegram needs 1 client connections
+    sockets_needed = 1
+    socket.consume_sockets(sockets_needed, "telegram_bot")(config)
+    return config
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -106,7 +117,8 @@ CONFIG_SCHEMA = cv.All(
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
-    cv.only_on([PLATFORM_ESP32]),
+    _consume_telegram_client_sockets,
+   # cv.only_on([PLATFORM_ESP32]),
 )
 
 
@@ -131,6 +143,7 @@ TELEGRAM_PUBLISH_ACTION_SCHEMA = cv.Schema(
 
 @automation.register_action(
     "telegram.publish", TelegramPublishAction, TELEGRAM_PUBLISH_ACTION_SCHEMA
+    # ,synchronous=True
 )
 async def telegram_publish_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
@@ -187,6 +200,7 @@ TELEGRAM_ANSWER_CALLBACK_ACTION_SCHEMA = cv.Schema(
 
 @automation.register_action(
     "telegram.answer_callback", TelegramAnswerCallBackAction, TELEGRAM_ANSWER_CALLBACK_ACTION_SCHEMA
+    # ,synchronous=True
 )
 async def telegram_answer_callback_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
@@ -219,6 +233,7 @@ TELEGRAM_DELETE_MESSAGE_ACTION_SCHEMA = cv.Schema(
 
 @automation.register_action(
     "telegram.delete_message", TelegramDeleteMessageAction, TELEGRAM_DELETE_MESSAGE_ACTION_SCHEMA
+    # ,synchronous=True
 )
 async def telegram_delete_message_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
@@ -233,7 +248,7 @@ async def telegram_delete_message_action_to_code(config, action_id, template_arg
 TELEGRAM_EDIT_REPLY_MARKUP_ACTION_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.use_id(WebNotify),
-        cv.Required(CONF_CHAT_ID): cv.templatable(cv.string),
+        cv.Optional(CONF_CHAT_ID): cv.templatable(cv.string),
         cv.Required(CONF_MESSAGE_ID): cv.templatable(cv.string),
         cv.Optional(CONF_INLINE_KEYBOARD): cv.templatable(cv.string),
         cv.Optional(CONF_DISABLE_WEB_PREVIEW): cv.templatable(cv.boolean),
@@ -243,12 +258,14 @@ TELEGRAM_EDIT_REPLY_MARKUP_ACTION_SCHEMA = cv.Schema(
 
 @automation.register_action(
     "telegram.edit_reply_markup", TelegramEditReplyMarkupAction, TELEGRAM_EDIT_REPLY_MARKUP_ACTION_SCHEMA
+    # ,synchronous=True
 )
 async def telegram_edit_reply_markup_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, paren)
     #args_ = args + [(cg.JsonObject, "root")]
-    template_ = await cg.templatable(config[CONF_CHAT_ID], args, cg.std_string)
+    if CONF_CHAT_ID:
+        template_ = await cg.templatable(config[CONF_CHAT_ID], args, cg.std_string)
     cg.add(var.set_chat_id(template_))
     template_ = await cg.templatable(config[CONF_MESSAGE_ID], args, cg.std_string)
     cg.add(var.set_message_id(template_))
@@ -305,16 +322,19 @@ async def telegram_edit_message_action_to_code(config, action_id, template_arg, 
 
 @coroutine_with_priority(40.0)
 async def to_code(config):
-    if CORE.using_arduino:
-        stack =f"SET_LOOP_TASK_STACK_SIZE(16 * 1024);"
-        if CONF_STACK_SIZE in config and config[CONF_STACK_SIZE]:
-            stack =f"SET_LOOP_TASK_STACK_SIZE({config[CONF_STACK_SIZE]} * 1024);"
-        cg.add_global(cg.RawStatement(stack))
-    if CORE.using_esp_idf: 
-        stack=6
-        if CONF_STACK_SIZE in config and config[CONF_STACK_SIZE]:
-            stack=config[CONF_STACK_SIZE]
-        CORE.data[KEY_ESP32][KEY_SDKCONFIG_OPTIONS][SDK_STACK_SIZE] = stack * 1024
+    # if CORE.using_arduino:
+    #     stack =f"SET_LOOP_TASK_STACK_SIZE(16 * 1024);"
+    #     if CONF_STACK_SIZE in config and config[CONF_STACK_SIZE]:
+    #         stack =f"SET_LOOP_TASK_STACK_SIZE({config[CONF_STACK_SIZE]} * 1024);"
+    #     cg.add_global(cg.RawStatement("#if not defined(USE_STACK_SIZE)"))
+    #     cg.add_global(cg.RawStatement(stack))
+    #     cg.add_global(cg.RawStatement("#define USE_STACK_SIZE"))
+    #     cg.add_global(cg.RawStatement("#endif"))
+    # if CORE.using_esp_idf: 
+    #     stack=16
+    #     if CONF_STACK_SIZE in config and config[CONF_STACK_SIZE]:
+    #         stack=config[CONF_STACK_SIZE]
+    #     CORE.data[KEY_ESP32][KEY_SDKCONFIG_OPTIONS][SDK_STACK_SIZE] = stack * 1024
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     if CONF_ALLOWED_IDS in config:
@@ -344,13 +364,13 @@ async def to_code(config):
 
     for conf in config.get(CONF_ON_MESSAGE, []):
         if CONF_CMD in conf:
-            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_CMD]+",","cmd")
+            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_CMD]+",","cmd",var)
             await automation.build_automation(trig, [(RemoteData,'x')], conf)
         if CONF_TEXT in conf:
-            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_TEXT]+",","text")
+            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_TEXT]+",","text",var)
             await automation.build_automation(trig, [(RemoteData,'x')], conf)
         if CONF_CALLBACK in conf:
-            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_CALLBACK]+",","callback")
+            trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID],","+conf[CONF_CALLBACK]+",","callback",var)
             await automation.build_automation(trig, [(RemoteData,'x')], conf)
 
     # src=os.path.join(pathlib.Path(__file__).parent.resolve(),"mongoose/mongoose.h")
@@ -363,7 +383,7 @@ async def to_code(config):
     #      copy_file_if_changed(src,dst)
     
     #remove old version file
-    dst=CORE.relative_build_path("src/mongoose.c")
-    if os.path.isfile(dst):
-          os.remove(dst)
+    # dst=CORE.relative_build_path("src/mongoose.c")
+    # if os.path.isfile(dst):
+    #       os.remove(dst)
 
